@@ -28,6 +28,7 @@ const MODEL_SWITCHES = {
   glm: 'glm-5.2',
   'glm-fast': 'glm-5.2-fast',
 };
+const GLM_PROVIDER_NAME = 'tai-glm';
 
 function readText(file) {
   return fs.readFileSync(file, 'utf8');
@@ -103,12 +104,14 @@ function parseOpenAICompatibility(text) {
     const providerMatch = line.match(/^\s{2}-\s*name:\s*(.*)$/);
     if (providerMatch) {
       pushCurrent();
-      current = { name: yamlValue(providerMatch[1]), priority: 0, baseUrl: '', models: [] };
+      current = { name: yamlValue(providerMatch[1]), priority: 0, disabled: false, baseUrl: '', models: [] };
       continue;
     }
     if (!current) continue;
     const priorityMatch = line.match(/^\s{4}priority:\s*(-?\d+)/);
     if (priorityMatch) current.priority = Number(priorityMatch[1]);
+    const disabledMatch = line.match(/^\s{4}disabled:\s*(.*)$/);
+    if (disabledMatch) current.disabled = /^(?:true|yes|1)$/i.test(yamlValue(disabledMatch[1]));
     const baseMatch = line.match(/^\s{4}base-url:\s*(.*)$/);
     if (baseMatch) current.baseUrl = yamlValue(baseMatch[1]);
     const modelMatch = line.match(/^\s{6}-\s*name:\s*(.*)$/);
@@ -138,21 +141,95 @@ function modelFamily(model) {
   return 'other';
 }
 
-function switchDefaultModel(mode) {
+function hasGlmOAuthAliases(text) {
+  let inSection = false;
+  for (const line of text.split(/\r?\n/)) {
+    if (!inSection) {
+      if (/^oauth-model-alias:\s*$/.test(line)) inSection = true;
+      continue;
+    }
+    if (/^[A-Za-z0-9_-]+:\s*/.test(line)) break;
+    const aliasMatch = line.match(/^\s+alias:\s*(.*)$/);
+    if (aliasMatch && /^glm-5\.2(?:-fast)?$/i.test(yamlValue(aliasMatch[1]))) return true;
+  }
+  return false;
+}
+
+function setCompatibilityProviderDisabled(text, providerName, disabled) {
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const lines = text.split(/\r?\n/);
+  let inSection = false;
+  let providerStart = -1;
+  let providerEnd = lines.length;
+
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (!inSection) {
+      if (/^openai-compatibility:\s*$/.test(line)) inSection = true;
+      continue;
+    }
+    if (/^[A-Za-z0-9_-]+:\s*/.test(line)) {
+      if (providerStart >= 0) providerEnd = index;
+      break;
+    }
+    const providerMatch = line.match(/^\s{2}-\s*name:\s*(.*)$/);
+    if (!providerMatch) continue;
+    if (providerStart >= 0) {
+      providerEnd = index;
+      break;
+    }
+    if (yamlValue(providerMatch[1]).toLowerCase() === providerName.toLowerCase()) {
+      providerStart = index;
+    }
+  }
+  if (providerStart < 0) {
+    throw new Error(`OpenAI compatibility provider was not found: ${providerName}`);
+  }
+
+  for (let index = providerStart + 1; index < providerEnd; index++) {
+    if (/^\s{4}disabled:\s*/.test(lines[index])) {
+      lines[index] = `    disabled: ${disabled}`;
+      return lines.join(eol);
+    }
+  }
+  lines.splice(providerStart + 1, 0, `    disabled: ${disabled}`);
+  return lines.join(eol);
+}
+
+function writeTextAtomic(file, text) {
+  const temp = `${file}.${process.pid}.tmp`;
+  const modeBits = fs.statSync(file).mode & 0o777;
+  fs.writeFileSync(temp, text, { mode: modeBits });
+  fs.chmodSync(temp, modeBits);
+  fs.renameSync(temp, file);
+}
+
+function switchGear(mode) {
   const target = MODEL_SWITCHES[mode];
   if (!target) throw new Error(`unknown switch target: ${mode}`);
-  const current = readText(CODEX_CONFIG_PATH);
-  if (!/^model\s*=.*$/m.test(current)) {
+  const glmEnabled = mode !== 'gpt';
+  const codexCurrent = readText(CODEX_CONFIG_PATH);
+  const proxyCurrent = readText(CONFIG_PATH);
+  if (!/^model\s*=.*$/m.test(codexCurrent)) {
     throw new Error(`top-level model setting was not found in ${CODEX_CONFIG_PATH}`);
   }
-  const updated = current.replace(/^model\s*=.*$/m, `model = "${target}"`);
-  if (updated === current) return { changed: false, model: target };
-  const temp = `${CODEX_CONFIG_PATH}.${process.pid}.tmp`;
-  const modeBits = fs.statSync(CODEX_CONFIG_PATH).mode & 0o777;
-  fs.writeFileSync(temp, updated, { mode: modeBits });
-  fs.chmodSync(temp, modeBits);
-  fs.renameSync(temp, CODEX_CONFIG_PATH);
-  return { changed: true, model: target };
+  if (hasGlmOAuthAliases(proxyCurrent)) {
+    throw new Error('GLM isolation is blocked by oauth-model-alias entries for glm-5.2; remove those aliases first');
+  }
+  const codexUpdated = codexCurrent.replace(/^model\s*=.*$/m, `model = "${target}"`);
+  const proxyUpdated = setCompatibilityProviderDisabled(proxyCurrent, GLM_PROVIDER_NAME, !glmEnabled);
+  const codexChanged = codexUpdated !== codexCurrent;
+  const proxyChanged = proxyUpdated !== proxyCurrent;
+
+  // Enable the proxy route before selecting GLM; select GPT before disabling it.
+  if (glmEnabled) {
+    if (proxyChanged) writeTextAtomic(CONFIG_PATH, proxyUpdated);
+    if (codexChanged) writeTextAtomic(CODEX_CONFIG_PATH, codexUpdated);
+  } else {
+    if (codexChanged) writeTextAtomic(CODEX_CONFIG_PATH, codexUpdated);
+    if (proxyChanged) writeTextAtomic(CONFIG_PATH, proxyUpdated);
+  }
+  return { changed: codexChanged || proxyChanged, model: target, glmEnabled };
 }
 
 function curlQuote(value) {
@@ -354,6 +431,19 @@ function loadTaiStatus() {
   return empty;
 }
 
+function disabledTaiStatus() {
+  return {
+    source: null,
+    cadence: null,
+    disabled: true,
+    models: {
+      'glm-5.2': { catalog: null, completion: null },
+      'glm-5.2-fast': { catalog: null, completion: null },
+    },
+    error: null,
+  };
+}
+
 function sumRecent(recent) {
   return (recent || []).reduce((sum, item) => ({
     success: sum.success + Number(item.success || 0),
@@ -513,6 +603,7 @@ function loadRuntime(includeRelayUsage = true) {
     accounts,
     relays: parseRelayEntries(config),
     compatibilityProviders: parseOpenAICompatibility(config),
+    glmOAuthFallback: hasGlmOAuthAliases(config),
     defaultModel: parseCodexDefaultModel(codexConfig),
     apiKeyUsage: includeRelayUsage
       ? managementRequest(key, '/v0/management/api-key-usage')
@@ -674,6 +765,7 @@ function sanitizedCredits(account) {
 function loadSnapshot() {
   const runtime = loadRuntime(true);
   const state = loadCoordinatorState();
+  const family = modelFamily(runtime.defaultModel);
   const personal = runtime.accounts.map(account => {
     const recent = sumRecent(account.entry.recent_requests);
     return {
@@ -717,13 +809,17 @@ function loadSnapshot() {
       return {
         name: provider.name,
         priority: provider.priority,
+        enabled: !provider.disabled,
         base_url: provider.baseUrl,
         models: provider.models.map(model => model.alias || model.name).filter(Boolean),
         ...usage,
       };
     });
   const daemon = coordinatorStatus();
-  const family = modelFamily(runtime.defaultModel);
+  const glmEnabled = glmProviders.some(provider => provider.enabled);
+  const gptRoute = personal.some(account => account.upstream_ready && account.local_status === 'active' && !account.local_unavailable)
+    ? 'personal_plus'
+    : 'relay_fallback';
   return {
     timestamp: new Date().toISOString(),
     mode: {
@@ -732,20 +828,22 @@ function loadSnapshot() {
       label: family === 'glm_non_gpt' ? 'GLM 5.2 / NON-GPT'
         : family === 'openai_gpt' ? 'OPENAI GPT / CODEX' : 'OTHER MODEL',
       policy: family === 'glm_non_gpt'
-        ? 'TAI GLM -> Personal Plus on pre-output failure'
-        : 'Personal Plus -> OpenTech Plus -> OpenTech Pro -> sorryios',
+        ? (glmEnabled ? 'TAI GLM only; no cross-family GPT fallback' : 'BLOCKED: GLM gear is disabled')
+        : 'Personal Plus -> OpenTech Plus -> OpenTech Pro -> sorryios; GLM disabled',
     },
     personal,
     glm: {
+      enabled: glmEnabled,
+      isolated: !runtime.glmOAuthFallback,
       providers: glmProviders,
-      status: loadTaiStatus(),
-      fallback_model: 'gpt-5.6-sol',
-      fallback_scope: 'connection/HTTP/pre-output failures only',
+      status: glmEnabled ? loadTaiStatus() : disabledTaiStatus(),
+      fallback_model: null,
+      fallback_scope: 'disabled',
     },
     relays,
-    route: personal.some(account => account.upstream_ready && account.local_status === 'active' && !account.local_unavailable)
-      ? 'personal_plus'
-      : 'relay_fallback',
+    route: family === 'glm_non_gpt'
+      ? (glmEnabled ? 'glm_only' : 'glm_blocked')
+      : gptRoute,
     automation: {
       enabled: state.auto_reset_enabled !== false,
       policy: state.policy,
@@ -850,10 +948,11 @@ function sectionTitle(label, colors, width) {
 function printCompactSnapshot(snapshot, colors, width) {
   const modeTone = snapshot.mode.family === 'glm_non_gpt' ? 'warn' : 'good';
   const readyAccounts = snapshot.personal.filter(account => account.upstream_ready && account.local_status === 'active' && !account.local_unavailable);
-  const routeTone = snapshot.route === 'personal_plus' ? 'good' : 'warn';
-  const routeLabel = snapshot.mode.family === 'glm_non_gpt'
-    ? (snapshot.route === 'personal_plus' ? 'GLM → PLUS READY' : 'GLM FALLBACK BLOCKED')
-    : (snapshot.route === 'personal_plus' ? 'PERSONAL PLUS' : 'RELAY FALLBACK');
+  const routeTone = snapshot.route === 'glm_blocked' ? 'bad'
+    : ['personal_plus', 'glm_only'].includes(snapshot.route) ? 'good' : 'warn';
+  const routeLabel = snapshot.route === 'glm_only' ? 'GLM ONLY'
+    : snapshot.route === 'glm_blocked' ? 'GLM BLOCKED'
+      : snapshot.route === 'personal_plus' ? 'PERSONAL PLUS' : 'RELAY FALLBACK';
   const daemonTone = snapshot.automation.daemon_running ? 'good' : 'warn';
   console.log(`${colors.cyan(colors.bold('CODEX+ USAGE'))}  ${colors.dim(formatDate(snapshot.timestamp))}`);
   console.log(colors.blue('─'.repeat(width)));
@@ -874,9 +973,12 @@ function printCompactSnapshot(snapshot, colors, width) {
     }
   }
 
-  const unhealthyModels = snapshot.glm.providers.flatMap(provider => provider.models).filter(model => snapshot.glm.status.models?.[model]?.completion?.up === false).length;
-  const glmTone = snapshot.glm.status.error || unhealthyModels ? 'warn' : 'good';
-  console.log(`  ${colors.bold('GLM')}     ${statusTag(unhealthyModels ? `${unhealthyModels} DEGRADED` : 'HEALTHY', glmTone, colors)}  ${snapshot.glm.providers.length} provider(s)`);
+  const unhealthyModels = snapshot.glm.enabled
+    ? snapshot.glm.providers.flatMap(provider => provider.models).filter(model => snapshot.glm.status.models?.[model]?.completion?.up === false).length
+    : 0;
+  const glmTone = snapshot.glm.enabled && (snapshot.glm.status.error || unhealthyModels) ? 'warn' : 'good';
+  const glmLabel = snapshot.glm.enabled ? (unhealthyModels ? `${unhealthyModels} DEGRADED` : 'ENABLED') : 'DISABLED';
+  console.log(`  ${colors.bold('GLM')}     ${statusTag(glmLabel, glmTone, colors)}  ${snapshot.glm.isolated ? 'strict gate' : 'cross-family alias found'}`);
   console.log(`  ${colors.bold('AUTO')}    ${statusTag(snapshot.automation.daemon_running ? 'RUNNING' : 'STOPPED', daemonTone, colors)}  interval ${snapshot.automation.interval_seconds}s${snapshot.automation.last_check ? ` · checked ${formatDate(snapshot.automation.last_check)}` : ''}`);
   if (snapshot.automation.last_error) console.log(`  ${colors.red('LAST ERROR')}  ${snapshot.automation.last_error.message}`);
   console.log(colors.blue('─'.repeat(width)));
@@ -897,29 +999,34 @@ function printFullSnapshot(snapshot, colors, width) {
     console.log(`  ${statusTag('MISSING', 'bad', colors)} No GLM compatibility provider found.`);
   }
   for (const provider of snapshot.glm.providers) {
-    const role = snapshot.mode.family === 'glm_non_gpt' ? 'SELECTED PRIMARY' : 'READY TO SELECT';
-    console.log(`  ${statusTag(role, snapshot.mode.family === 'glm_non_gpt' ? 'warn' : 'good', colors)} ${colors.bold(provider.name)}  priority=${provider.priority}`);
+    const role = provider.enabled
+      ? (snapshot.mode.family === 'glm_non_gpt' ? 'ENABLED PRIMARY' : 'ENABLED / NOT SELECTED')
+      : 'DISABLED BY GATE';
+    console.log(`  ${statusTag(role, provider.enabled ? 'warn' : 'good', colors)} ${colors.bold(provider.name)}  priority=${provider.priority}`);
     for (const model of provider.models) {
       const health = snapshot.glm.status.models?.[model] || {};
-      const catalog = health.catalog?.up === true ? statusTag('LISTED', 'good', colors)
-        : health.catalog?.up === false ? statusTag('LIST DOWN', 'bad', colors)
-          : statusTag('LIST ?', 'warn', colors);
-      const completion = health.completion?.up === true ? statusTag('COMPLETION UP', 'good', colors)
-        : health.completion?.up === false ? statusTag('COMPLETION DOWN', 'bad', colors)
-          : statusTag('COMPLETION ?', 'warn', colors);
+      const catalog = !provider.enabled ? statusTag('GATED OFF', 'good', colors)
+        : health.catalog?.up === true ? statusTag('LISTED', 'good', colors)
+          : health.catalog?.up === false ? statusTag('LIST DOWN', 'bad', colors)
+            : statusTag('LIST ?', 'warn', colors);
+      const completion = !provider.enabled ? statusTag('NO HEALTH CALL', 'good', colors)
+        : health.completion?.up === true ? statusTag('COMPLETION UP', 'good', colors)
+          : health.completion?.up === false ? statusTag('COMPLETION DOWN', 'bad', colors)
+            : statusTag('COMPLETION ?', 'warn', colors);
       const checkedAt = health.completion?.at || health.catalog?.at;
       console.log(`  ${colors.gray('├')} ${pad(model, 17)} ${pad(catalog, 14)} ${completion}${checkedAt ? `  ${colors.dim(checkedAt)}` : ''}`);
     }
     const totals = provider.loaded ? `${provider.success} ok / ${provider.failed} fail` : 'not loaded';
     console.log(`  ${colors.gray('└')} ${pad('requests', 17)} ${pad(totals, 20)} recent ${provider.recent_success} ok / ${provider.recent_failed} fail`);
   }
-  if (snapshot.glm.status.error) {
+  if (!snapshot.glm.enabled) {
+    console.log(`  ${colors.dim('GLM status polling is disabled while the gear is off.')}`);
+  } else if (snapshot.glm.status.error) {
     console.log(`  ${statusTag('STATUS ERROR', 'warn', colors)} ${snapshot.glm.status.error}`);
   } else {
     console.log(`  ${colors.dim(`Status source: ${snapshot.glm.status.source} (about ${snapshot.glm.status.cadence} cadence)`)}`);
   }
-  console.log(`  ${colors.magenta(colors.bold('FAILOVER'))}  GLM error before output → Personal Plus as ${snapshot.glm.fallback_model}`);
-  console.log(`  ${colors.dim('No transparent model switch is possible after GLM has already emitted output.')}`);
+  console.log(`  ${colors.magenta(colors.bold('GATE'))}  ${snapshot.glm.enabled ? 'GLM API routing enabled' : 'GLM API routing disabled'} · ${snapshot.glm.isolated ? 'no GPT alias fallback' : 'WARNING: GPT alias fallback exists'}`);
 
   console.log('');
   console.log(sectionTitle('PERSONAL CHATGPT PLUS', colors, width));
@@ -948,20 +1055,19 @@ function printFullSnapshot(snapshot, colors, width) {
   const personalRecentSuccess = snapshot.personal.reduce((sum, item) => sum + item.recent_success, 0);
   const personalRecentFailed = snapshot.personal.reduce((sum, item) => sum + item.recent_failed, 0);
   snapshot.glm.providers.forEach(provider => {
-    const role = snapshot.mode.family === 'glm_non_gpt' ? 'GLM PRIMARY' : 'GLM OPTIONAL';
+    const role = provider.enabled ? 'GLM PRIMARY' : 'GLM DISABLED';
     const totals = provider.loaded ? `${provider.success} ok / ${provider.failed} fail` : 'not loaded';
     console.log(`  ${pad(provider.priority, 7)}${pad('TAI GLM (non-GPT)', 22)}${pad(role, 17)}${pad(totals, 20)}${provider.recent_success} ok / ${provider.recent_failed} fail`);
   });
-  const personalRole = snapshot.mode.family === 'glm_non_gpt'
-    ? (snapshot.route === 'personal_plus' ? 'GLM FALLBACK' : 'BLOCKED')
-    : (snapshot.route === 'personal_plus' ? 'GPT PRIMARY' : 'BLOCKED');
+  const personalRole = snapshot.route === 'personal_plus' ? 'GPT PRIMARY'
+    : snapshot.mode.family === 'glm_non_gpt' ? 'GPT NOT USED' : 'BLOCKED';
   console.log(`  ${pad('0', 7)}${pad('Personal Plus', 22)}${pad(personalRole, 17)}${pad(`${personalSuccess} ok / ${personalFailed} fail`, 20)}${personalRecentSuccess} ok / ${personalRecentFailed} fail`);
   snapshot.relays.forEach((relay, index) => {
     const role = `GPT FALLBACK ${index + 1}`;
     const totals = relay.loaded ? `${relay.success} ok / ${relay.failed} fail` : 'not loaded';
     console.log(`  ${pad(relay.priority, 7)}${pad(relay.name, 22)}${pad(role, 17)}${pad(totals, 20)}${relay.recent_success} ok / ${relay.recent_failed} fail`);
   });
-  console.log(`  ${colors.dim('GLM aliases fall back to personal Plus; relay aliases remain on the GPT path.')}`);
+  console.log(`  ${colors.dim('GLM is disabled in GPT gear and has no cross-family alias fallback.')}`);
   console.log(`  ${colors.dim('Counters are local routing health, not provider balance or billing.')}`);
 
   console.log('');
@@ -1020,7 +1126,7 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`Usage: codex-plus-usage [options]\n\nOptions:\n  --compact          Show the concise one-screen dashboard\n  --full             Show the detailed dashboard (default)\n  --watch[=SECONDS]  Refresh the terminal dashboard (default: 15s)\n  --switch=TARGET    Set default gear: gpt, glm, or glm-fast\n  --daemon           Run quota recovery and reset-credit coordination\n  --interval=SECONDS Set daemon/watch interval\n  --json             Print a sanitized JSON snapshot\n  --read-only        Do not heal state or consume reset credits\n  --no-color         Disable ANSI colors\n  --self-test        Run local policy tests\n  -h, --help         Show this help`);
+  console.log(`Usage: codex-plus-usage [options]\n\nOptions:\n  --compact          Show the concise one-screen dashboard\n  --full             Show the detailed dashboard (default)\n  --watch[=SECONDS]  Refresh the terminal dashboard (default: 15s)\n  --switch=TARGET    Set gear: gpt disables GLM; glm/glm-fast enable it\n  --daemon           Run quota recovery and reset-credit coordination\n  --interval=SECONDS Set daemon/watch interval\n  --json             Print a sanitized JSON snapshot\n  --read-only        Do not heal state or consume reset credits\n  --no-color         Disable ANSI colors\n  --self-test        Run local policy tests\n  -h, --help         Show this help`);
 }
 
 function runSelfTest() {
@@ -1042,12 +1148,17 @@ function runSelfTest() {
   assert.strictEqual(modelFamily('gpt-5.6-sol'), 'openai_gpt');
   const parsedCompatibility = parseOpenAICompatibility('openai-compatibility:\n  - name: "test"\n    priority: 10\n    base-url: "https://example.test/v1"\n    models:\n      - name: "glm-5.2"\n        alias: "glm-5.2"\n');
   assert.deepStrictEqual(parsedCompatibility, [{
-    name: 'test', priority: 10, baseUrl: 'https://example.test/v1',
+    name: 'test', priority: 10, disabled: false, baseUrl: 'https://example.test/v1',
     models: [{ name: 'glm-5.2', alias: 'glm-5.2' }],
   }]);
+  const disabledConfig = setCompatibilityProviderDisabled('openai-compatibility:\n  - name: "tai-glm"\n    base-url: "https://example.test/v1"\n', 'tai-glm', true);
+  assert(disabledConfig.includes('    disabled: true\n'));
+  assert.strictEqual(parseOpenAICompatibility(disabledConfig)[0].disabled, true);
+  assert.strictEqual(hasGlmOAuthAliases('oauth-model-alias:\n  codex:\n    - name: "gpt-test"\n      alias: "glm-5.2"\n'), true);
+  assert.strictEqual(hasGlmOAuthAliases('oauth-model-alias:\n  codex:\n    - name: "gpt-test"\n      alias: "gpt-alias"\n'), false);
   const sanitized = details.credits.map(credit => ({ fingerprint: fingerprint(credit.id) }));
   assert(!JSON.stringify(sanitized).includes('early'));
-  console.log('self-test: 10 checks passed');
+  console.log('self-test: 14 checks passed');
 }
 
 function acquireDaemonPid() {
@@ -1142,9 +1253,10 @@ async function main() {
   if (options.help) return printHelp();
   if (options.selfTest) return runSelfTest();
   if (options.switchMode) {
-    const result = switchDefaultModel(options.switchMode);
+    const result = switchGear(options.switchMode);
     console.log(`${result.changed ? 'switched' : 'already selected'}: ${result.model}`);
-    console.log('This changes the default for new CLI/App sessions; an existing App task keeps its current model.');
+    console.log(`GLM gear: ${result.glmEnabled ? 'enabled' : 'disabled'} at the proxy route.`);
+    console.log('The proxy hot-reloads this gate; restart the App or start a new task to refresh its model list.');
     return;
   }
   if (options.daemon) return runDaemon(options);
