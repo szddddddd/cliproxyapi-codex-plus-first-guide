@@ -800,8 +800,9 @@ function windowLabel(seconds) {
 function colorizer(enabled) {
   const wrap = code => value => enabled ? `\x1b[${code}m${value}\x1b[0m` : String(value);
   return {
-    bold: wrap('1'), dim: wrap('2'), red: wrap('31'), green: wrap('32'),
-    yellow: wrap('33'), cyan: wrap('36'),
+    bold: wrap('1'), dim: wrap('2'), red: wrap('91'), green: wrap('92'),
+    yellow: wrap('93'), blue: wrap('94'), magenta: wrap('95'), cyan: wrap('96'),
+    white: wrap('97'), gray: wrap('90'),
   };
 }
 
@@ -816,39 +817,82 @@ function pad(value, width) {
 
 function quotaBar(usedPercent, colors, width = 30) {
   const used = Math.min(100, Math.max(0, Number(usedPercent) || 0));
-  const filled = Math.round((used / 100) * width);
-  const content = '#'.repeat(filled) + '-'.repeat(width - filled);
+  const filled = used > 0 ? Math.max(1, Math.round((used / 100) * width)) : 0;
   const paint = used >= 90 ? colors.red : used >= 70 ? colors.yellow : colors.green;
-  return `[${paint(content)}]`;
+  return `${colors.gray('│')}${paint('█'.repeat(filled))}${colors.gray('░'.repeat(width - filled))}${colors.gray('│')}`;
 }
 
 function statusTag(label, tone, colors) {
-  const paint = tone === 'good' ? colors.green : tone === 'warn' ? colors.yellow : colors.red;
-  return paint(`[${label}]`);
+  const paint = tone === 'good' ? colors.green
+    : tone === 'warn' ? colors.yellow
+      : tone === 'neutral' ? colors.blue : colors.red;
+  const symbol = tone === 'good' ? '●' : tone === 'warn' ? '◆' : tone === 'neutral' ? '●' : '✕';
+  return paint(`${symbol} ${label}`);
 }
 
-function printWindow(window, colors, missingLabel = 'window') {
-  if (!window) return `  ${pad(missingLabel, 8)} ${colors.dim('not reported by upstream')}`;
+function printWindow(window, colors, missingLabel = 'window', compact = false) {
+  const labelWidth = compact ? 5 : 9;
+  if (!window) return `  ${colors.gray('├')} ${pad(missingLabel, labelWidth)} ${colors.dim('not reported')}`;
   const used = Number(window.used_percent || 0);
   const reset = window.reset_after_seconds !== undefined
     ? `reset in ${formatDuration(window.reset_after_seconds)}`
     : window.reset_at ? `reset ${formatDate(Number(window.reset_at) * 1000)}` : 'reset unknown';
-  return `  ${pad(windowLabel(window.limit_window_seconds), 8)} ${quotaBar(used, colors)}  ${pad(`${used}% used`, 10)} ${pad(`${Math.max(0, 100 - used)}% left`, 11)} ${colors.dim(reset)}`;
+  const barWidth = compact ? 14 : 24;
+  const usage = compact ? `${Math.max(0, 100 - used)}% left` : `${used}% used · ${Math.max(0, 100 - used)}% left`;
+  return `  ${colors.gray('├')} ${pad(windowLabel(window.limit_window_seconds), labelWidth)} ${quotaBar(used, colors, barWidth)}  ${pad(usage, compact ? 9 : 21)} ${colors.dim(reset)}`;
 }
 
-function printSnapshot(snapshot, options) {
-  const colors = colorizer(options.color);
-  const width = Math.max(76, Math.min(110, process.stdout.columns || 96));
-  const rule = '-'.repeat(width);
-  console.log(colors.cyan(colors.bold('CODEX GPT + GLM ROUTING STATUS')) + `  ${colors.dim(formatDate(snapshot.timestamp))}`);
-  console.log(rule);
+function sectionTitle(label, colors, width) {
+  const prefix = `── ${label} `;
+  return colors.blue(prefix + '─'.repeat(Math.max(0, width - prefix.length)));
+}
+
+function printCompactSnapshot(snapshot, colors, width) {
   const modeTone = snapshot.mode.family === 'glm_non_gpt' ? 'warn' : 'good';
-  console.log(`${colors.bold('DEFAULT GEAR')}  ${statusTag(snapshot.mode.label, modeTone, colors)}  ${colors.bold(snapshot.mode.default_model || 'not set')}`);
-  console.log(`${colors.bold('POLICY')}        ${snapshot.mode.policy}`);
-  console.log(`              ${colors.dim('The Codex App can override this per task; this is the default for new sessions.')}`);
+  const readyAccounts = snapshot.personal.filter(account => account.upstream_ready && account.local_status === 'active' && !account.local_unavailable);
+  const routeTone = snapshot.route === 'personal_plus' ? 'good' : 'warn';
+  const routeLabel = snapshot.mode.family === 'glm_non_gpt'
+    ? (snapshot.route === 'personal_plus' ? 'GLM → PLUS READY' : 'GLM FALLBACK BLOCKED')
+    : (snapshot.route === 'personal_plus' ? 'PERSONAL PLUS' : 'RELAY FALLBACK');
+  const daemonTone = snapshot.automation.daemon_running ? 'good' : 'warn';
+  console.log(`${colors.cyan(colors.bold('CODEX+ USAGE'))}  ${colors.dim(formatDate(snapshot.timestamp))}`);
+  console.log(colors.blue('─'.repeat(width)));
+  console.log(`  ${colors.bold('MODEL')}   ${statusTag(snapshot.mode.label, modeTone, colors)}  ${colors.white(snapshot.mode.default_model || 'not set')}`);
+  console.log(`  ${colors.bold('ROUTE')}   ${statusTag(routeLabel, routeTone, colors)}  ${colors.dim(snapshot.mode.policy)}`);
+
+  if (!snapshot.personal.length) {
+    console.log(`  ${colors.bold('PLUS')}    ${statusTag('MISSING', 'bad', colors)}  No OAuth account found`);
+  }
+  for (const account of snapshot.personal) {
+    const ready = readyAccounts.includes(account);
+    console.log(`  ${colors.bold('PLUS')}    ${statusTag(ready ? 'READY' : 'BLOCKED', ready ? 'good' : 'bad', colors)}  ${account.account} · ${String(account.plan || 'unknown').toUpperCase()}`);
+    if (account.error) console.log(`  ${colors.gray('└')} ${colors.red(account.error)}`);
+    else {
+      console.log(printWindow(account.primary, colors, 'quota', true));
+      console.log(printWindow(account.secondary, colors, '5h', true));
+      console.log(`  ${colors.gray('└')} reset credits  ${colors.cyan(colors.bold(account.reset_credits.available_count))}`);
+    }
+  }
+
+  const unhealthyModels = snapshot.glm.providers.flatMap(provider => provider.models).filter(model => snapshot.glm.status.models?.[model]?.completion?.up === false).length;
+  const glmTone = snapshot.glm.status.error || unhealthyModels ? 'warn' : 'good';
+  console.log(`  ${colors.bold('GLM')}     ${statusTag(unhealthyModels ? `${unhealthyModels} DEGRADED` : 'HEALTHY', glmTone, colors)}  ${snapshot.glm.providers.length} provider(s)`);
+  console.log(`  ${colors.bold('AUTO')}    ${statusTag(snapshot.automation.daemon_running ? 'RUNNING' : 'STOPPED', daemonTone, colors)}  interval ${snapshot.automation.interval_seconds}s${snapshot.automation.last_check ? ` · checked ${formatDate(snapshot.automation.last_check)}` : ''}`);
+  if (snapshot.automation.last_error) console.log(`  ${colors.red('LAST ERROR')}  ${snapshot.automation.last_error.message}`);
+  console.log(colors.blue('─'.repeat(width)));
+  console.log(colors.dim('  Tip: use --full for routing counters and health details.'));
+}
+
+function printFullSnapshot(snapshot, colors, width) {
+  const modeTone = snapshot.mode.family === 'glm_non_gpt' ? 'warn' : 'good';
+  console.log(`${colors.cyan(colors.bold('CODEX+ ROUTING & QUOTA'))}  ${colors.dim(formatDate(snapshot.timestamp))}`);
+  console.log(colors.blue('═'.repeat(width)));
+  console.log(`${colors.bold('Default model')}  ${statusTag(snapshot.mode.label, modeTone, colors)}  ${colors.white(colors.bold(snapshot.mode.default_model || 'not set'))}`);
+  console.log(`${colors.bold('Policy')}         ${snapshot.mode.policy}`);
+  console.log(`               ${colors.dim('Default for new sessions; the Codex App may override it per task.')}`);
 
   console.log('');
-  console.log(colors.bold('TAI GLM 5.2  (NON-GPT MODEL FAMILY)'));
+  console.log(sectionTitle('TAI GLM 5.2 · NON-GPT', colors, width));
   if (!snapshot.glm.providers.length) {
     console.log(`  ${statusTag('MISSING', 'bad', colors)} No GLM compatibility provider found.`);
   }
@@ -864,41 +908,41 @@ function printSnapshot(snapshot, options) {
         : health.completion?.up === false ? statusTag('COMPLETION DOWN', 'bad', colors)
           : statusTag('COMPLETION ?', 'warn', colors);
       const checkedAt = health.completion?.at || health.catalog?.at;
-      console.log(`  ${pad(model, 17)} ${catalog} ${completion}${checkedAt ? `  ${colors.dim(checkedAt)}` : ''}`);
+      console.log(`  ${colors.gray('├')} ${pad(model, 17)} ${pad(catalog, 14)} ${completion}${checkedAt ? `  ${colors.dim(checkedAt)}` : ''}`);
     }
     const totals = provider.loaded ? `${provider.success} ok / ${provider.failed} fail` : 'not loaded';
-    console.log(`  ${pad('requests', 17)} ${pad(totals, 20)} recent ${provider.recent_success} ok / ${provider.recent_failed} fail`);
+    console.log(`  ${colors.gray('└')} ${pad('requests', 17)} ${pad(totals, 20)} recent ${provider.recent_success} ok / ${provider.recent_failed} fail`);
   }
   if (snapshot.glm.status.error) {
-    console.log(`  ${colors.yellow('status page')} ${snapshot.glm.status.error}`);
+    console.log(`  ${statusTag('STATUS ERROR', 'warn', colors)} ${snapshot.glm.status.error}`);
   } else {
     console.log(`  ${colors.dim(`Status source: ${snapshot.glm.status.source} (about ${snapshot.glm.status.cadence} cadence)`)}`);
   }
-  console.log(`  ${colors.cyan('FAILOVER')} GLM error before output -> Personal Plus as ${snapshot.glm.fallback_model}.`);
+  console.log(`  ${colors.magenta(colors.bold('FAILOVER'))}  GLM error before output → Personal Plus as ${snapshot.glm.fallback_model}`);
   console.log(`  ${colors.dim('No transparent model switch is possible after GLM has already emitted output.')}`);
 
   console.log('');
-  console.log(colors.bold('PERSONAL CHATGPT PLUS'));
+  console.log(sectionTitle('PERSONAL CHATGPT PLUS', colors, width));
   if (!snapshot.personal.length) console.log(`  ${statusTag('MISSING', 'bad', colors)} No OAuth account found.`);
   for (const account of snapshot.personal) {
     const ready = account.upstream_ready && account.local_status === 'active' && !account.local_unavailable;
     const tag = ready ? statusTag('READY', 'good', colors) : statusTag('BLOCKED', 'bad', colors);
-    console.log(`  ${tag} ${colors.bold(account.account)}  plan=${String(account.plan || 'unknown').toUpperCase()}  local=${account.local_status}`);
+    console.log(`  ${tag}  ${colors.bold(account.account)}  ${colors.dim(`plan ${String(account.plan || 'unknown').toUpperCase()} · local ${account.local_status}`)}`);
     if (account.error) {
-      console.log(`  ${colors.red('ERROR')} ${account.error}`);
+      console.log(`  ${statusTag('ERROR', 'bad', colors)} ${account.error}`);
       continue;
     }
     console.log(printWindow(account.primary, colors, 'primary'));
     console.log(printWindow(account.secondary, colors, '5h'));
     const next = account.reset_credits.next;
     const nextText = next?.expires_at ? `${formatDate(next.expires_at)} (${formatDuration((Date.parse(next.expires_at) - Date.now()) / 1000)} left)` : 'no expiry detail';
-    console.log(`  ${pad('resets', 8)} ${colors.cyan(`${account.reset_credits.available_count} Full reset credit(s)`)}${next ? `  next: ${nextText}` : ''}`);
-    console.log(`  ${pad('requests', 8)} total ${account.success} ok / ${account.failed} failed  |  last ~200m ${account.recent_success} ok / ${account.recent_failed} failed`);
+    console.log(`  ${colors.gray('├')} ${pad('resets', 9)} ${colors.cyan(colors.bold(`${account.reset_credits.available_count} full reset credit(s)`))}${next ? `  ${colors.dim(`next ${nextText}`)}` : ''}`);
+    console.log(`  ${colors.gray('└')} ${pad('requests', 9)} total ${account.success} ok / ${account.failed} failed  ·  recent ${account.recent_success} ok / ${account.recent_failed} failed`);
   }
 
   console.log('');
-  console.log(colors.bold('ROUTING COUNTERS'));
-  console.log(`  ${pad('PRIO', 7)}${pad('ROUTE', 22)}${pad('ROLE', 17)}${pad('TOTAL', 20)}RECENT ~200M`);
+  console.log(sectionTitle('ROUTING COUNTERS', colors, width));
+  console.log(colors.dim(`  ${pad('PRIO', 7)}${pad('ROUTE', 22)}${pad('ROLE', 17)}${pad('TOTAL', 20)}RECENT ~200M`));
   const personalSuccess = snapshot.personal.reduce((sum, item) => sum + item.success, 0);
   const personalFailed = snapshot.personal.reduce((sum, item) => sum + item.failed, 0);
   const personalRecentSuccess = snapshot.personal.reduce((sum, item) => sum + item.recent_success, 0);
@@ -921,16 +965,23 @@ function printSnapshot(snapshot, options) {
   console.log(`  ${colors.dim('Counters are local routing health, not provider balance or billing.')}`);
 
   console.log('');
-  console.log(colors.bold('AUTOMATION'));
+  console.log(sectionTitle('AUTOMATION', colors, width));
   console.log(`  ${snapshot.automation.enabled ? statusTag('ON', 'good', colors) : statusTag('OFF', 'bad', colors)} Full reset only at an actual limit; earliest expiry first.`);
   console.log(`  ${snapshot.automation.daemon_running ? statusTag('RUNNING', 'good', colors) : statusTag('STOPPED', 'warn', colors)} coordinator  interval=${snapshot.automation.interval_seconds}s${snapshot.automation.last_check ? `  last check ${formatDate(snapshot.automation.last_check)}` : ''}`);
   if (snapshot.automation.last_action) {
-    console.log(`  ${colors.cyan('last action')} ${formatDate(snapshot.automation.last_action.at)}  ${snapshot.automation.last_action.message}`);
+    console.log(`  ${colors.cyan(colors.bold('LAST ACTION'))}  ${formatDate(snapshot.automation.last_action.at)}  ${snapshot.automation.last_action.message}`);
   }
   if (snapshot.automation.last_error) {
-    console.log(`  ${colors.red('last error')}  ${formatDate(snapshot.automation.last_error.at)}  ${snapshot.automation.last_error.message}`);
+    console.log(`  ${colors.red(colors.bold('LAST ERROR'))}   ${formatDate(snapshot.automation.last_error.at)}  ${snapshot.automation.last_error.message}`);
   }
-  console.log(rule);
+  console.log(colors.blue('═'.repeat(width)));
+}
+
+function printSnapshot(snapshot, options) {
+  const colors = colorizer(options.color);
+  const width = Math.max(72, Math.min(110, process.stdout.columns || 96));
+  if (options.view === 'compact') printCompactSnapshot(snapshot, colors, width);
+  else printFullSnapshot(snapshot, colors, width);
 }
 
 function parseArgs(argv) {
@@ -942,6 +993,7 @@ function parseArgs(argv) {
     selfTest: false,
     help: false,
     switchMode: null,
+    view: 'full',
     interval: null,
     color: process.stdout.isTTY && !process.env.NO_COLOR,
   };
@@ -952,6 +1004,8 @@ function parseArgs(argv) {
     else if (arg.startsWith('--interval=')) options.interval = Number(arg.slice(11));
     else if (arg === '--json') options.json = true;
     else if (arg === '--read-only') options.readOnly = true;
+    else if (arg === '--compact') options.view = 'compact';
+    else if (arg === '--full') options.view = 'full';
     else if (arg.startsWith('--switch=')) options.switchMode = arg.slice(9);
     else if (arg === '--self-test') options.selfTest = true;
     else if (arg === '--no-color') options.color = false;
@@ -966,7 +1020,7 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`Usage: codex-plus-usage [options]\n\nOptions:\n  --watch[=SECONDS]  Refresh the terminal dashboard (default: 15s)\n  --switch=TARGET    Set default gear: gpt, glm, or glm-fast\n  --daemon           Run quota recovery and reset-credit coordination\n  --interval=SECONDS Set daemon/watch interval\n  --json             Print a sanitized JSON snapshot\n  --read-only        Do not heal state or consume reset credits\n  --no-color         Disable ANSI colors\n  --self-test        Run local policy tests\n  -h, --help         Show this help`);
+  console.log(`Usage: codex-plus-usage [options]\n\nOptions:\n  --compact          Show the concise one-screen dashboard\n  --full             Show the detailed dashboard (default)\n  --watch[=SECONDS]  Refresh the terminal dashboard (default: 15s)\n  --switch=TARGET    Set default gear: gpt, glm, or glm-fast\n  --daemon           Run quota recovery and reset-credit coordination\n  --interval=SECONDS Set daemon/watch interval\n  --json             Print a sanitized JSON snapshot\n  --read-only        Do not heal state or consume reset credits\n  --no-color         Disable ANSI colors\n  --self-test        Run local policy tests\n  -h, --help         Show this help`);
 }
 
 function runSelfTest() {
