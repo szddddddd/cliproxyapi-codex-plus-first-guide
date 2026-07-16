@@ -1,12 +1,10 @@
-# CLIProxyAPI 配置 Codex CLI：个人 ChatGPT Plus 优先，多中转自动回退
+# CLIProxyAPI 配置 Codex：GPT Plus / GLM 双挡位与多上游回退
 
-这是一份经过实际部署验证的配置记录，目标是让 Codex CLI 统一连接本机
-[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)，并按以下顺序选择凭据：
+这是一份经过实际部署验证的配置记录，目标是让 Codex CLI 和桌面 App 统一连接本机
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)，并提供两条并列、可手动选择的模型路径：
 
-1. 个人 ChatGPT Plus OAuth
-2. `api.opentech.top` Codex Plus Pool
-3. `api.opentech.top` Codex Pro Pool
-4. `https://sorryios.ai/codex` 低优先级备用线路
+1. GPT 挡位：个人 ChatGPT Plus OAuth → OpenTech Plus → OpenTech Pro → sorryios
+2. GLM 挡位：自部署 `glm-5.2` / `glm-5.2-fast` → 个人 ChatGPT Plus
 
 本文以 Linux、root 用户和 CLIProxyAPI `v7.2.77` 为例。路径可按实际用户调整。
 公开模板将本地客户端密钥与上游中转站密钥分离；这比直接复用已有中转密钥更安全，且不改变路由顺序。
@@ -17,14 +15,20 @@
 > [!WARNING]
 > 仅添加你本人拥有或获准使用的 ChatGPT 账号和中转服务。不要公开设备代码、OAuth JSON、API Key 或管理密钥。
 
+> [!NOTE]
+> GLM 是独立模型家族，不是 GPT。这里的“并列挡位”表示用户先选择模型家族；GLM 凭据使用更高的内部优先级，是为了在 GLM 挡位先调用 GLM，失败后才由 GPT Plus 接管。
+
 ## 架构与实际行为
 
 ```mermaid
 flowchart LR
-    A["Codex CLI"] --> B["CLIProxyAPI\n127.0.0.1:8317"]
+    A["Codex CLI / App"] --> S{"选择模型挡位"}
+    S -->|"gpt-*"| B["CLIProxyAPI\n127.0.0.1:8317"]
+    S -->|"glm-5.2*"| I["TAI GLM\npriority +10"]
     G["Quota coordinator\n30s polling"] --> B
     G --> H["ChatGPT usage +\nreset credits"]
     B --> C["个人 Plus OAuth\npriority 0"]
+    I -. "连接、HTTP 或输出前失败" .-> C
     C -. "失败、限流或冷却" .-> D["OpenTech Plus\npriority -10"]
     D -. "失败、限流或冷却" .-> E["OpenTech Pro\npriority -20"]
     E -. "失败、限流或冷却" .-> F["sorryios\npriority -30"]
@@ -33,6 +37,9 @@ flowchart LR
 关键行为：
 
 - `routing.strategy: fill-first` 优先使用当前可用的最高优先级凭据。
+- 请求 `gpt-*` 时进入 GPT 路径；请求 `glm-5.2*` 时进入 GLM 路径，不会随机混用模型家族。
+- GLM 路径中 TAI 为 `+10`，个人 Plus 为 `0`；TAI 在产生输出前失败时，CLIProxyAPI 会改用 `gpt-5.6-sol`。
+- 一旦 GLM 已经产生部分输出，代理无法在同一响应中无缝改成 GPT；长时间无响应也依赖下游请求超时，不能保证即时切换。
 - 在已验证版本中，没有显式设置优先级的 Codex OAuth 凭据默认优先级为 `0`。
 - 将中转站优先级设为负数，即可让个人 OAuth 排在中转站之前。
 - `request-retry` 和 `max-retry-credentials` 控制失败后的重试与候选凭据数量。
@@ -93,6 +100,7 @@ chmod 600 /root/.config/cliproxyapi/management.key
 | `<OPENTECH_PLUS_KEY>` | OpenTech Codex Plus Pool API Key |
 | `<OPENTECH_PRO_KEY>` | OpenTech Codex Pro Pool API Key |
 | `<SORRYIOS_KEY>` | sorryios 备用 API Key，可选 |
+| `<TAI_GLM_KEY>` | TAI GLM OpenAI-compatible Bearer token |
 | `<OUTBOUND_PROXY_URL>` | 集群访问外网所需的 HTTP/SOCKS 代理；不需要时填空字符串 |
 
 不要把替换后的真实运行配置提交到 Git。
@@ -153,7 +161,41 @@ codex-api-key:
     priority: -30
     base-url: "https://sorryios.ai/codex"
     websockets: false
+
+openai-compatibility:
+  - name: "tai-glm"
+    priority: 10
+    base-url: "https://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/default/custom-tai/v1"
+    api-key-entries:
+      - api-key: "<TAI_GLM_KEY>"
+    models:
+      - name: "glm-5.2"
+        alias: "glm-5.2"
+        display-name: "GLM-5.2 (non-GPT)"
+        input-modalities: [text]
+        output-modalities: [text]
+      - name: "glm-5.2-fast"
+        alias: "glm-5.2-fast"
+        display-name: "GLM-5.2 Fast (non-GPT)"
+        input-modalities: [text]
+        output-modalities: [text]
+
+# 保留 gpt-5.6-sol，同时让个人 Plus 支持两个 GLM 客户端别名。
+# 只有实际选中的 GLM 上游失败时，调度器才会使用这两个映射。
+oauth-model-alias:
+  codex:
+    - name: "gpt-5.6-sol"
+      alias: "glm-5.2"
+      fork: true
+    - name: "gpt-5.6-sol"
+      alias: "glm-5.2-fast"
+      fork: true
 ```
+
+Cloudflare 网关根地址通常以 `.../custom-tai` 结束，完整补全地址以
+`.../custom-tai/v1/chat/completions` 结束。CLIProxyAPI 会自行追加 `/chat/completions`，
+所以 `openai-compatibility.base-url` 必须填到 `.../custom-tai/v1`，不能填完整补全 URL，
+也不能漏掉 `/v1`。
 
 保护配置文件：
 
@@ -311,6 +353,36 @@ timeout_ms = 5000
 refresh_interval_ms = 0
 ```
 
+顶层 `model` 决定新会话的默认挡位。单次 CLI 会话可以直接覆盖：
+
+```bash
+codex -m gpt-5.6-sol
+codex -m glm-5.2
+codex -m glm-5.2-fast
+```
+
+安装第 8 节的面板脚本后，也可以持久修改顶层 `model`，不会改 provider、reasoning effort 或项目配置：
+
+```bash
+code-plus-usage --switch=gpt
+code-plus-usage --switch=glm
+code-plus-usage --switch=glm-fast
+```
+
+这只影响之后新建的 CLI / App 会话。已经打开的 Codex App 任务保留自己的模型，
+应在模型选择器中切换或新建任务。
+
+### Codex App 会不会出现 GLM 按钮？
+
+Codex App 没有为任意自定义 provider 自动生成永久“快捷按钮”的承诺；它使用 composer 下方的模型选择器，
+内容来自 app-server 的 `model/list`。在 Codex CLI `0.144.4` 与 CLIProxyAPI `v7.2.77` 的实测组合中，
+`glm-5.2` 和 `glm-5.2-fast` 会进入 `model/list`，所以完整重启 App 后可以成为可选条目。
+
+但当前 CLIProxyAPI 在“GLM 主路由 + GPT 跨 provider 回退”共用同一个模型别名时，会把目录展示元数据合并成
+GPT fallback 的名称，实测两个 GLM ID 的 `displayName` 都可能显示为 `GPT 5.6 Sol`。
+因此它不是可靠、清晰的 GLM 可视化按钮。本文不启用静态 `model_catalog_json` 去覆盖目录，因为那会冻结模型列表，
+妨碍 GPT 新模型自动出现；终端面板和 `--switch` 以实际模型 ID 为准，并明确标注 `NON-GPT`。
+
 修改前先备份：
 
 ```bash
@@ -359,7 +431,7 @@ tail -f /root/.local/share/cliproxyapi/cliproxyapi.log
 
 `GET /v1/models` 只能证明本地服务和认证正常，不能完整证明每条上游生成链路都可用。
 
-## 8. 查看 Plus 配额和中转使用情况
+## 8. 查看 Plus、GLM 和中转使用情况
 
 ### 安装终端仪表盘和额度协调器
 
@@ -381,14 +453,27 @@ code-plus-usage --watch
 code-plus-usage --watch=30
 ```
 
+切换新会话默认模型：
+
+```bash
+code-plus-usage --switch=gpt       # gpt-5.6-sol
+code-plus-usage --switch=glm       # glm-5.2，非 GPT
+code-plus-usage --switch=glm-fast  # glm-5.2-fast，非 GPT
+```
+
 界面显示：
 
-- 当前实际路由是个人 Plus 还是中转回退
+- 新会话默认挡位、实际模型 ID，以及 GPT / GLM `NON-GPT` 家族标识
+- GLM provider 的本机成功/失败计数和 GLM → Plus 回退规则
+- TAI 状态页中 `glm-5.2`、`glm-5.2-fast` 的模型列表与补全监控状态
 - Plus 本地认证状态和 ChatGPT 上游可用状态
 - 5 小时、7 天等额度窗口、已用/剩余百分比和重置时间
 - Full reset 数量及最早到期时间
 - 个人 OAuth、OpenTech Plus/Pro、sorryios 的本机成功/失败计数
 - 后台协调器运行状态、最后检查、最后动作和错误
+
+TAI 状态页标注约 10 分钟更新一次，不是单次请求的实时探针；本机 GLM 成功/失败计数来自 CLIProxyAPI，
+两者应结合判断。面板不会输出 GLM token、OAuth token、中转 key 或 reset credit ID。
 
 启动后台协调器：
 
@@ -497,7 +582,7 @@ POST /v0/management/reset-quota
 
 ```bash
 rg -n --hidden \
-  'Bearer |api[_-]?key|access_token|refresh_token|management.key|client.key' \
+  'Bearer |cfut_[A-Za-z0-9]+|sk-[A-Za-z0-9]{20,}|api[_-]?key|access_token|refresh_token|management.key|client.key' \
   .
 ```
 
@@ -549,6 +634,21 @@ code-plus-usage
 
 保持 Plus Pool 为 `-10`、Pro Pool 为 `-20`，并让冷却和跨凭据重试生效。先直接验证 Pro Pool 的 key 和 base URL 可用，再判断是 Plus Pool 波动、集群出站代理问题还是 CLIProxyAPI 配置问题。
 
+### GLM 挡位什么时候会自动切换到 Plus？
+
+已验证的原生行为是：GLM 发生连接错误、HTTP 错误，或在尚未产生输出时失败，CLIProxyAPI 会继续选择较低优先级的个人 Plus，
+并把客户端模型别名映射到 `gpt-5.6-sol`。GLM 已经输出一部分内容后不能无缝换模型；纯粹长时间挂起也要等请求上下文超时，
+因此“自动切换”不是任意故障下的即时抢占。
+
+### 为什么选择 GLM 后响应里的 model 是 gpt-5.6-sol？
+
+这表示本次 GLM 请求触发了预期回退，最终回答来自个人 Plus，而不是伪装成 GLM。`code-plus-usage` 会把 GLM 失败计数和个人 Plus 成功计数分开显示。
+
+### `glm-5.2-fast` 在模型列表里，为什么仍然不能调用？
+
+模型目录只表示 provider 声明了这个模型，不保证当前有可用生成渠道。应同时检查 TAI 状态页的 Completion 监控和一次最小生成请求。
+如果 fast 返回上游故障，当前配置会自动尝试个人 Plus。
+
 ### systemctl 为什么无法启动服务？
 
 先检查：
@@ -592,11 +692,14 @@ cp -a /root/.codex/config.toml.pre-cliproxy-<TIMESTAMP> \
 - Codex CLI 使用 Responses wire API
 - 一个个人 ChatGPT Plus OAuth 凭据
 - OpenTech Codex Plus Pool 与 Pro Pool
+- TAI OpenAI-compatible `glm-5.2` 成功请求
+- `glm-5.2-fast` 上游不可用时自动回退到个人 Plus
+- Codex app-server `model/list` 能看到两个 GLM ID，并复现跨 provider 别名的 displayName 合并限制
 - 一个低优先级 sorryios 备用入口
 - SSH 集群，PID 1 为 `sshd`，通过 `nohup` 维持代理进程
 - 本地管理面板仅通过 SSH tunnel 访问
 - Full reset 后遗留的本地 `usage_limit_reached` 状态自动恢复
 - 2 个带到期时间的 Full reset credit，最早到期项选择策略通过自测
-- `code-plus-usage` 终端仪表盘与 30 秒后台协调器
+- `code-plus-usage` GPT / GLM 终端仪表盘、持久挡位切换与 30 秒后台协调器
 
 不同版本的 CLIProxyAPI、Codex CLI 和上游中转服务可能改变字段或行为。升级前应先备份配置，并在独立终端验证个人 OAuth、每条中转线路和回退顺序。

@@ -8,6 +8,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const CONFIG_PATH = process.env.CLIPROXY_CONFIG || '/root/.config/cliproxyapi/config.yaml';
+const CODEX_CONFIG_PATH = process.env.CODEX_CONFIG || '/root/.codex/config.toml';
 const AUTH_DIR = process.env.CLIPROXY_AUTH_DIR || '/root/.local/share/cliproxyapi/auths';
 const MANAGEMENT_KEY_PATH = process.env.CLIPROXY_MANAGEMENT_KEY || '/root/.config/cliproxyapi/management.key';
 const MANAGEMENT_BASE = process.env.CLIPROXY_MANAGEMENT_URL || 'http://127.0.0.1:8317';
@@ -18,7 +19,15 @@ const COORDINATOR_LOCK_PATH = path.join(RUNTIME_DIR, 'plus-quota-coordinator.loc
 const USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
 const CONSUME_RESET_CREDIT_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume';
+const TAI_STATUS_PAGE_URL = 'https://tai.zambar.workers.dev/status/tai';
+const TAI_HEARTBEAT_URL = 'https://tai.zambar.workers.dev/api/status-page/heartbeat/tai';
 const CURL = '/usr/bin/curl';
+
+const MODEL_SWITCHES = {
+  gpt: 'gpt-5.6-sol',
+  glm: 'glm-5.2',
+  'glm-fast': 'glm-5.2-fast',
+};
 
 function readText(file) {
   return fs.readFileSync(file, 'utf8');
@@ -71,6 +80,79 @@ function parseRelayEntries(text) {
   }
   if (current && current.key) entries.push(current);
   return entries;
+}
+
+function parseOpenAICompatibility(text) {
+  const lines = text.split(/\r?\n/);
+  const providers = [];
+  let inSection = false;
+  let current = null;
+  let currentModel = null;
+  const pushCurrent = () => {
+    if (current?.name) providers.push(current);
+    current = null;
+    currentModel = null;
+  };
+
+  for (const line of lines) {
+    if (!inSection) {
+      if (/^openai-compatibility:\s*$/.test(line)) inSection = true;
+      continue;
+    }
+    if (/^[A-Za-z0-9_-]+:\s*/.test(line)) break;
+    const providerMatch = line.match(/^\s{2}-\s*name:\s*(.*)$/);
+    if (providerMatch) {
+      pushCurrent();
+      current = { name: yamlValue(providerMatch[1]), priority: 0, baseUrl: '', models: [] };
+      continue;
+    }
+    if (!current) continue;
+    const priorityMatch = line.match(/^\s{4}priority:\s*(-?\d+)/);
+    if (priorityMatch) current.priority = Number(priorityMatch[1]);
+    const baseMatch = line.match(/^\s{4}base-url:\s*(.*)$/);
+    if (baseMatch) current.baseUrl = yamlValue(baseMatch[1]);
+    const modelMatch = line.match(/^\s{6}-\s*name:\s*(.*)$/);
+    if (modelMatch) {
+      currentModel = { name: yamlValue(modelMatch[1]), alias: '' };
+      current.models.push(currentModel);
+      continue;
+    }
+    const aliasMatch = line.match(/^\s{8}alias:\s*(.*)$/);
+    if (aliasMatch && currentModel) currentModel.alias = yamlValue(aliasMatch[1]);
+  }
+  pushCurrent();
+  return providers;
+}
+
+function parseCodexDefaultModel(text) {
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^model\s*=\s*(.*)$/);
+    if (match) return yamlValue(match[1]);
+  }
+  return '';
+}
+
+function modelFamily(model) {
+  if (/^glm(?:-|\/)/i.test(model)) return 'glm_non_gpt';
+  if (/^gpt(?:-|\/)/i.test(model)) return 'openai_gpt';
+  return 'other';
+}
+
+function switchDefaultModel(mode) {
+  const target = MODEL_SWITCHES[mode];
+  if (!target) throw new Error(`unknown switch target: ${mode}`);
+  const current = readText(CODEX_CONFIG_PATH);
+  if (!/^model\s*=.*$/m.test(current)) {
+    throw new Error(`top-level model setting was not found in ${CODEX_CONFIG_PATH}`);
+  }
+  const updated = current.replace(/^model\s*=.*$/m, `model = "${target}"`);
+  if (updated === current) return { changed: false, model: target };
+  const temp = `${CODEX_CONFIG_PATH}.${process.pid}.tmp`;
+  const modeBits = fs.statSync(CODEX_CONFIG_PATH).mode & 0o777;
+  fs.writeFileSync(temp, updated, { mode: modeBits });
+  fs.chmodSync(temp, modeBits);
+  fs.renameSync(temp, CODEX_CONFIG_PATH);
+  return { changed: true, model: target };
 }
 
 function curlQuote(value) {
@@ -208,6 +290,70 @@ function findUsageForRelay(usage, relay) {
   return null;
 }
 
+function findUsageForCompatibility(usage, provider) {
+  const buckets = [
+    usage?.[provider.name],
+    usage?.[`openai-compatible-${String(provider.name || '').toLowerCase()}`],
+  ].filter(Boolean);
+  const targetBase = normalizeUrl(provider.baseUrl);
+  const totals = { success: 0, failed: 0, recent_success: 0, recent_failed: 0, loaded: false };
+  for (const bucket of buckets) {
+    for (const [composite, value] of Object.entries(bucket)) {
+      const split = composite.indexOf('|');
+      const base = split < 0 ? composite : composite.slice(0, split);
+      if (targetBase && normalizeUrl(base) !== targetBase) continue;
+      const recent = sumRecent(value?.recent_requests);
+      totals.success += Number(value?.success || 0);
+      totals.failed += Number(value?.failed || 0);
+      totals.recent_success += recent.success;
+      totals.recent_failed += recent.failed;
+      totals.loaded = true;
+    }
+  }
+  return totals;
+}
+
+function loadTaiStatus() {
+  const empty = {
+    source: TAI_STATUS_PAGE_URL,
+    cadence: '10m',
+    models: {
+      'glm-5.2': { catalog: null, completion: null },
+      'glm-5.2-fast': { catalog: null, completion: null },
+    },
+    error: null,
+  };
+  try {
+    const page = curlRequest({ url: TAI_STATUS_PAGE_URL, timeout: 10 });
+    const heartbeat = JSON.parse(curlRequest({ url: TAI_HEARTBEAT_URL, timeout: 10 }));
+    const monitorPattern = /\{'id':(\d+),'name':'([^']+)','sendUrl':\d+,'type':'[^']+'\}/g;
+    let match;
+    let found = 0;
+    while ((match = monitorPattern.exec(page)) !== null) {
+      const monitorId = match[1];
+      const name = match[2];
+      const lower = name.toLowerCase();
+      const model = lower.includes('glm-5.2 fast') ? 'glm-5.2-fast'
+        : lower.includes('glm-5.2') ? 'glm-5.2' : null;
+      const check = lower.includes('completion') ? 'completion'
+        : lower.includes('model page') ? 'catalog' : null;
+      if (!model || !check) continue;
+      const samples = heartbeat?.heartbeatList?.[monitorId];
+      const latest = Array.isArray(samples) && samples.length ? samples[samples.length - 1] : null;
+      empty.models[model][check] = latest ? {
+        up: Number(latest.status) === 1,
+        at: latest.time || null,
+        ping_ms: latest.ping ?? null,
+      } : null;
+      found++;
+    }
+    if (!found) empty.error = 'status page monitor metadata was not found';
+  } catch (error) {
+    empty.error = error.message;
+  }
+  return empty;
+}
+
 function sumRecent(recent) {
   return (recent || []).reduce((sum, item) => ({
     success: sum.success + Number(item.success || 0),
@@ -332,6 +478,7 @@ function releaseLock() {
 
 function loadRuntime(includeRelayUsage = true) {
   const config = readText(CONFIG_PATH);
+  const codexConfig = readTextSafe(CODEX_CONFIG_PATH);
   const key = readText(MANAGEMENT_KEY_PATH).trim();
   if (!key) throw new Error(`management key file is empty: ${MANAGEMENT_KEY_PATH}`);
   const authResponse = managementRequest(key, '/v0/management/auth-files');
@@ -365,6 +512,8 @@ function loadRuntime(includeRelayUsage = true) {
     key,
     accounts,
     relays: parseRelayEntries(config),
+    compatibilityProviders: parseOpenAICompatibility(config),
+    defaultModel: parseCodexDefaultModel(codexConfig),
     apiKeyUsage: includeRelayUsage
       ? managementRequest(key, '/v0/management/api-key-usage')
       : {},
@@ -561,10 +710,38 @@ function loadSnapshot() {
       loaded: Boolean(item),
     };
   });
+  const glmProviders = runtime.compatibilityProviders
+    .filter(provider => provider.models.some(model => /^glm-/i.test(model.alias || model.name)))
+    .map(provider => {
+      const usage = findUsageForCompatibility(runtime.apiKeyUsage, provider);
+      return {
+        name: provider.name,
+        priority: provider.priority,
+        base_url: provider.baseUrl,
+        models: provider.models.map(model => model.alias || model.name).filter(Boolean),
+        ...usage,
+      };
+    });
   const daemon = coordinatorStatus();
+  const family = modelFamily(runtime.defaultModel);
   return {
     timestamp: new Date().toISOString(),
+    mode: {
+      default_model: runtime.defaultModel || null,
+      family,
+      label: family === 'glm_non_gpt' ? 'GLM 5.2 / NON-GPT'
+        : family === 'openai_gpt' ? 'OPENAI GPT / CODEX' : 'OTHER MODEL',
+      policy: family === 'glm_non_gpt'
+        ? 'TAI GLM -> Personal Plus on pre-output failure'
+        : 'Personal Plus -> OpenTech Plus -> OpenTech Pro -> sorryios',
+    },
     personal,
+    glm: {
+      providers: glmProviders,
+      status: loadTaiStatus(),
+      fallback_model: 'gpt-5.6-sol',
+      fallback_scope: 'connection/HTTP/pre-output failures only',
+    },
     relays,
     route: personal.some(account => account.upstream_ready && account.local_status === 'active' && !account.local_unavailable)
       ? 'personal_plus'
@@ -663,11 +840,42 @@ function printSnapshot(snapshot, options) {
   const colors = colorizer(options.color);
   const width = Math.max(76, Math.min(110, process.stdout.columns || 96));
   const rule = '-'.repeat(width);
-  console.log(colors.cyan(colors.bold('CODEX PLUS-FIRST STATUS')) + `  ${colors.dim(formatDate(snapshot.timestamp))}`);
+  console.log(colors.cyan(colors.bold('CODEX GPT + GLM ROUTING STATUS')) + `  ${colors.dim(formatDate(snapshot.timestamp))}`);
   console.log(rule);
-  console.log(`${colors.bold('当前路由')}  ${snapshot.route === 'personal_plus'
-    ? statusTag('PERSONAL PLUS', 'good', colors)
-    : statusTag('RELAY FALLBACK', 'warn', colors)}`);
+  const modeTone = snapshot.mode.family === 'glm_non_gpt' ? 'warn' : 'good';
+  console.log(`${colors.bold('DEFAULT GEAR')}  ${statusTag(snapshot.mode.label, modeTone, colors)}  ${colors.bold(snapshot.mode.default_model || 'not set')}`);
+  console.log(`${colors.bold('POLICY')}        ${snapshot.mode.policy}`);
+  console.log(`              ${colors.dim('The Codex App can override this per task; this is the default for new sessions.')}`);
+
+  console.log('');
+  console.log(colors.bold('TAI GLM 5.2  (NON-GPT MODEL FAMILY)'));
+  if (!snapshot.glm.providers.length) {
+    console.log(`  ${statusTag('MISSING', 'bad', colors)} No GLM compatibility provider found.`);
+  }
+  for (const provider of snapshot.glm.providers) {
+    const role = snapshot.mode.family === 'glm_non_gpt' ? 'SELECTED PRIMARY' : 'READY TO SELECT';
+    console.log(`  ${statusTag(role, snapshot.mode.family === 'glm_non_gpt' ? 'warn' : 'good', colors)} ${colors.bold(provider.name)}  priority=${provider.priority}`);
+    for (const model of provider.models) {
+      const health = snapshot.glm.status.models?.[model] || {};
+      const catalog = health.catalog?.up === true ? statusTag('LISTED', 'good', colors)
+        : health.catalog?.up === false ? statusTag('LIST DOWN', 'bad', colors)
+          : statusTag('LIST ?', 'warn', colors);
+      const completion = health.completion?.up === true ? statusTag('COMPLETION UP', 'good', colors)
+        : health.completion?.up === false ? statusTag('COMPLETION DOWN', 'bad', colors)
+          : statusTag('COMPLETION ?', 'warn', colors);
+      const checkedAt = health.completion?.at || health.catalog?.at;
+      console.log(`  ${pad(model, 17)} ${catalog} ${completion}${checkedAt ? `  ${colors.dim(checkedAt)}` : ''}`);
+    }
+    const totals = provider.loaded ? `${provider.success} ok / ${provider.failed} fail` : 'not loaded';
+    console.log(`  ${pad('requests', 17)} ${pad(totals, 20)} recent ${provider.recent_success} ok / ${provider.recent_failed} fail`);
+  }
+  if (snapshot.glm.status.error) {
+    console.log(`  ${colors.yellow('status page')} ${snapshot.glm.status.error}`);
+  } else {
+    console.log(`  ${colors.dim(`Status source: ${snapshot.glm.status.source} (about ${snapshot.glm.status.cadence} cadence)`)}`);
+  }
+  console.log(`  ${colors.cyan('FAILOVER')} GLM error before output -> Personal Plus as ${snapshot.glm.fallback_model}.`);
+  console.log(`  ${colors.dim('No transparent model switch is possible after GLM has already emitted output.')}`);
 
   console.log('');
   console.log(colors.bold('PERSONAL CHATGPT PLUS'));
@@ -690,18 +898,27 @@ function printSnapshot(snapshot, options) {
 
   console.log('');
   console.log(colors.bold('ROUTING COUNTERS'));
-  console.log(`  ${pad('PRIO', 7)}${pad('ROUTE', 22)}${pad('ROLE', 13)}${pad('TOTAL', 20)}RECENT ~200M`);
+  console.log(`  ${pad('PRIO', 7)}${pad('ROUTE', 22)}${pad('ROLE', 17)}${pad('TOTAL', 20)}RECENT ~200M`);
   const personalSuccess = snapshot.personal.reduce((sum, item) => sum + item.success, 0);
   const personalFailed = snapshot.personal.reduce((sum, item) => sum + item.failed, 0);
   const personalRecentSuccess = snapshot.personal.reduce((sum, item) => sum + item.recent_success, 0);
   const personalRecentFailed = snapshot.personal.reduce((sum, item) => sum + item.recent_failed, 0);
-  console.log(`  ${pad('0', 7)}${pad('Personal Plus', 22)}${pad(snapshot.route === 'personal_plus' ? 'PRIMARY' : 'BLOCKED', 13)}${pad(`${personalSuccess} ok / ${personalFailed} fail`, 20)}${personalRecentSuccess} ok / ${personalRecentFailed} fail`);
-  snapshot.relays.forEach((relay, index) => {
-    const role = `FALLBACK ${index + 1}`;
-    const totals = relay.loaded ? `${relay.success} ok / ${relay.failed} fail` : 'not loaded';
-    console.log(`  ${pad(relay.priority, 7)}${pad(relay.name, 22)}${pad(role, 13)}${pad(totals, 20)}${relay.recent_success} ok / ${relay.recent_failed} fail`);
+  snapshot.glm.providers.forEach(provider => {
+    const role = snapshot.mode.family === 'glm_non_gpt' ? 'GLM PRIMARY' : 'GLM OPTIONAL';
+    const totals = provider.loaded ? `${provider.success} ok / ${provider.failed} fail` : 'not loaded';
+    console.log(`  ${pad(provider.priority, 7)}${pad('TAI GLM (non-GPT)', 22)}${pad(role, 17)}${pad(totals, 20)}${provider.recent_success} ok / ${provider.recent_failed} fail`);
   });
-  console.log(`  ${colors.dim('Relay counters are local routing health, not provider balance or billing.')}`);
+  const personalRole = snapshot.mode.family === 'glm_non_gpt'
+    ? (snapshot.route === 'personal_plus' ? 'GLM FALLBACK' : 'BLOCKED')
+    : (snapshot.route === 'personal_plus' ? 'GPT PRIMARY' : 'BLOCKED');
+  console.log(`  ${pad('0', 7)}${pad('Personal Plus', 22)}${pad(personalRole, 17)}${pad(`${personalSuccess} ok / ${personalFailed} fail`, 20)}${personalRecentSuccess} ok / ${personalRecentFailed} fail`);
+  snapshot.relays.forEach((relay, index) => {
+    const role = `GPT FALLBACK ${index + 1}`;
+    const totals = relay.loaded ? `${relay.success} ok / ${relay.failed} fail` : 'not loaded';
+    console.log(`  ${pad(relay.priority, 7)}${pad(relay.name, 22)}${pad(role, 17)}${pad(totals, 20)}${relay.recent_success} ok / ${relay.recent_failed} fail`);
+  });
+  console.log(`  ${colors.dim('GLM aliases fall back to personal Plus; relay aliases remain on the GPT path.')}`);
+  console.log(`  ${colors.dim('Counters are local routing health, not provider balance or billing.')}`);
 
   console.log('');
   console.log(colors.bold('AUTOMATION'));
@@ -724,6 +941,7 @@ function parseArgs(argv) {
     readOnly: false,
     selfTest: false,
     help: false,
+    switchMode: null,
     interval: null,
     color: process.stdout.isTTY && !process.env.NO_COLOR,
   };
@@ -734,6 +952,7 @@ function parseArgs(argv) {
     else if (arg.startsWith('--interval=')) options.interval = Number(arg.slice(11));
     else if (arg === '--json') options.json = true;
     else if (arg === '--read-only') options.readOnly = true;
+    else if (arg.startsWith('--switch=')) options.switchMode = arg.slice(9);
     else if (arg === '--self-test') options.selfTest = true;
     else if (arg === '--no-color') options.color = false;
     else if (arg === '--help' || arg === '-h') options.help = true;
@@ -747,7 +966,7 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`Usage: codex-plus-usage [options]\n\nOptions:\n  --watch[=SECONDS]  Refresh the terminal dashboard (default: 15s)\n  --daemon           Run quota recovery and reset-credit coordination\n  --interval=SECONDS Set daemon/watch interval\n  --json             Print a sanitized JSON snapshot\n  --read-only        Do not heal state or consume reset credits\n  --no-color         Disable ANSI colors\n  --self-test        Run local policy tests\n  -h, --help         Show this help`);
+  console.log(`Usage: codex-plus-usage [options]\n\nOptions:\n  --watch[=SECONDS]  Refresh the terminal dashboard (default: 15s)\n  --switch=TARGET    Set default gear: gpt, glm, or glm-fast\n  --daemon           Run quota recovery and reset-credit coordination\n  --interval=SECONDS Set daemon/watch interval\n  --json             Print a sanitized JSON snapshot\n  --read-only        Do not heal state or consume reset credits\n  --no-color         Disable ANSI colors\n  --self-test        Run local policy tests\n  -h, --help         Show this help`);
 }
 
 function runSelfTest() {
@@ -765,9 +984,16 @@ function runSelfTest() {
   assert.strictEqual(localRecoveryNeeded({ status: 'error', status_message: 'usage_limit_reached', unavailable: false }, { rate_limit: { allowed: true, limit_reached: false } }), true);
   assert.strictEqual(localRecoveryNeeded({ status: 'error', status_message: 'invalid model', unavailable: true }, { rate_limit: { allowed: true, limit_reached: false } }), false);
   assert.strictEqual(localRecoveryNeeded({ status: 'active', status_message: '', unavailable: false }, { rate_limit: { allowed: true, limit_reached: false } }), false);
+  assert.strictEqual(modelFamily('glm-5.2'), 'glm_non_gpt');
+  assert.strictEqual(modelFamily('gpt-5.6-sol'), 'openai_gpt');
+  const parsedCompatibility = parseOpenAICompatibility('openai-compatibility:\n  - name: "test"\n    priority: 10\n    base-url: "https://example.test/v1"\n    models:\n      - name: "glm-5.2"\n        alias: "glm-5.2"\n');
+  assert.deepStrictEqual(parsedCompatibility, [{
+    name: 'test', priority: 10, baseUrl: 'https://example.test/v1',
+    models: [{ name: 'glm-5.2', alias: 'glm-5.2' }],
+  }]);
   const sanitized = details.credits.map(credit => ({ fingerprint: fingerprint(credit.id) }));
   assert(!JSON.stringify(sanitized).includes('early'));
-  console.log('self-test: 7 checks passed');
+  console.log('self-test: 10 checks passed');
 }
 
 function acquireDaemonPid() {
@@ -861,6 +1087,12 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) return printHelp();
   if (options.selfTest) return runSelfTest();
+  if (options.switchMode) {
+    const result = switchDefaultModel(options.switchMode);
+    console.log(`${result.changed ? 'switched' : 'already selected'}: ${result.model}`);
+    console.log('This changes the default for new CLI/App sessions; an existing App task keeps its current model.');
+    return;
+  }
   if (options.daemon) return runDaemon(options);
   return runDashboard(options);
 }
