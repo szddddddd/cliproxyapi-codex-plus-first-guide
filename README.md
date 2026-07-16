@@ -22,6 +22,8 @@
 ```mermaid
 flowchart LR
     A["Codex CLI"] --> B["CLIProxyAPI\n127.0.0.1:8317"]
+    G["Quota coordinator\n30s polling"] --> B
+    G --> H["ChatGPT usage +\nreset credits"]
     B --> C["个人 Plus OAuth\npriority 0"]
     C -. "失败、限流或冷却" .-> D["OpenTech Plus\npriority -10"]
     D -. "失败、限流或冷却" .-> E["OpenTech Pro\npriority -20"]
@@ -35,6 +37,8 @@ flowchart LR
 - 将中转站优先级设为负数，即可让个人 OAuth 排在中转站之前。
 - `request-retry` 和 `max-retry-credentials` 控制失败后的重试与候选凭据数量。
 - 高优先级凭据从冷却状态恢复后，会重新具备被选择的资格。
+- ChatGPT 上游额度恢复后，协调器会清除 CLIProxyAPI 遗留的本地 `error/quota/cooldown` 状态。
+- 额度真正耗尽时，协调器只选择 `status=available` 的 Full reset，并按 `expires_at` 从早到晚兑换。
 - 这不是按余额百分比调度，也不是精确的成本优化器。
 
 ## 1. 安装官方 CLIProxyAPI
@@ -169,7 +173,7 @@ remote-management:
   disable-control-panel: true
 ```
 
-但这样也会关闭 `/v0/management` 管理接口。
+但这样也会关闭 `/v0/management` 管理接口，并使本文的自动状态恢复和 Full reset 协调器无法工作。
 
 ## 4. 登录个人 ChatGPT Plus
 
@@ -357,6 +361,79 @@ tail -f /root/.local/share/cliproxyapi/cliproxyapi.log
 
 ## 8. 查看 Plus 配额和中转使用情况
 
+### 安装终端仪表盘和额度协调器
+
+仓库中的 [`bin/codex-plus-usage`](bin/codex-plus-usage) 需要 Node.js 18 或更高版本：
+
+```bash
+install -m 700 bin/codex-plus-usage /root/.local/bin/codex-plus-usage
+ln -sfn codex-plus-usage /root/.local/bin/code-plus-usage
+
+node --check /root/.local/bin/codex-plus-usage
+/root/.local/bin/codex-plus-usage --self-test
+```
+
+单次查看和持续刷新：
+
+```bash
+code-plus-usage
+code-plus-usage --watch
+code-plus-usage --watch=30
+```
+
+界面显示：
+
+- 当前实际路由是个人 Plus 还是中转回退
+- Plus 本地认证状态和 ChatGPT 上游可用状态
+- 5 小时、7 天等额度窗口、已用/剩余百分比和重置时间
+- Full reset 数量及最早到期时间
+- 个人 OAuth、OpenTech Plus/Pro、sorryios 的本机成功/失败计数
+- 后台协调器运行状态、最后检查、最后动作和错误
+
+启动后台协调器：
+
+```bash
+NODE_BIN=$(command -v node)
+nohup "$NODE_BIN" /root/.local/bin/codex-plus-usage \
+  --daemon --interval=30 \
+  > /root/.local/share/cliproxyapi/plus-quota-coordinator.log \
+  2>&1 </dev/null &
+```
+
+在 SSH 集群中，可将下面的检查放到 Node.js 初始化之后的 `~/.zshrc`；常规服务器应优先交给 systemd、supervisord 或集群进程管理器：
+
+```bash
+_pid_file=/root/.local/share/cliproxyapi/plus-quota-coordinator.pid
+_pid=$(tr -d '\n' < "$_pid_file" 2>/dev/null || true)
+if [ -z "$_pid" ] || ! kill -0 "$_pid" 2>/dev/null; then
+    NODE_BIN=$(command -v node)
+    nohup "$NODE_BIN" /root/.local/bin/codex-plus-usage \
+      --daemon --interval=30 \
+      > /root/.local/share/cliproxyapi/plus-quota-coordinator.log \
+      2>&1 </dev/null &
+fi
+unset _pid_file _pid NODE_BIN
+```
+
+协调器会自己维护以下权限为 `600` 的文件：
+
+```text
+/root/.local/share/cliproxyapi/plus-quota-coordinator.pid
+/root/.local/share/cliproxyapi/plus-quota-coordinator.json
+/root/.local/share/cliproxyapi/plus-quota-coordinator.log
+```
+
+自动策略严格限制为：
+
+1. 上游额度健康但 CLIProxyAPI 仍是旧 `error` 时，只清理本地状态，不消耗 credit。
+2. 只有上游明确 `limit_reached=true`、`allowed=false` 或窗口达到 100% 时才考虑 Full reset。
+3. 获取详细 credit 列表，只保留 `available` 项，并选择最早 `expires_at`。
+4. 兑换前保存 credit ID 和幂等请求 ID；网络重试复用同一请求 ID，避免重复消耗。
+5. 兑换成功后调用 CLIProxyAPI `/reset-quota`，让个人 OAuth 立即恢复最高优先级。
+6. 上游只返回 credit 数量、没有到期详情或详情列表不完整时，自动兑换会停止，不猜测顺序。
+
+`--read-only` 可以完全关闭单次命令中的状态修复与兑换；`--json` 输出已经脱敏，不包含 OAuth token、API Key 或 reset credit ID。
+
 ### 官方管理面板
 
 CLIProxyAPI 的官方管理面板由
@@ -393,6 +470,7 @@ http://127.0.0.1:8317/management.html
 GET /v0/management/auth-files
 GET /v0/management/api-key-usage
 POST /v0/management/api-call
+POST /v0/management/reset-quota
 ```
 
 其中：
@@ -400,6 +478,7 @@ POST /v0/management/api-call
 - `auth-files` 提供 OAuth 凭据状态、成功/失败次数、冷却状态和最近请求桶。
 - `api-key-usage` 提供各 API Key 凭据的本机成功/失败次数和最近请求桶。
 - `api-call` 可让管理面板代表某个 OAuth 凭据查询上游配额。
+- `reset-quota` 只清理 CLIProxyAPI 本地额度/冷却状态，不会消耗 ChatGPT Full reset credit。
 
 这些原始接口可能返回账号标识或包含 API Key 的组合键。不要直接把原始 JSON 粘贴到公开位置，展示前必须过滤和脱敏。
 
@@ -432,6 +511,7 @@ rg -n --hidden \
 - 上游 API Key、OAuth token、设备代码和管理密钥不进入 Git。
 - 如果 API Key 曾出现在聊天记录、终端录屏或公开日志中，立即轮换。
 - 不在进程命令行参数中放置 OAuth access token。
+- 协调器状态文件可能暂存不透明的 reset credit ID 和幂等 ID，必须保持 `600`，不得提交到 Git。
 
 ## 10. 常见问题
 
@@ -450,6 +530,20 @@ CLIProxyAPI 不理解“剩余 5%”这个业务阈值。只要个人 OAuth 被�
 ### 为什么中转站统计重启后变成 0？
 
 原生成功/失败与最近请求统计是内存状态，不是持久化账本。
+
+### Full reset 后已经 100% left，为什么仍在调用中转站？
+
+ChatGPT 上游额度和 CLIProxyAPI 本地调度状态是两层状态。Full reset 会恢复上游额度，但 CLIProxyAPI 可能仍保留重置前的 `usage_limit_reached` 错误，导致个人 OAuth 继续被跳过。
+
+协调器会比较这两层状态：当上游返回 `allowed=true`、`limit_reached=false`，且本地仍保留明确的 quota/rate-limit 错误时，自动调用 `/v0/management/reset-quota` 清除旧状态。该接口也会同步清理持久化 `.cds` 冷却记录。可以用下面的命令立即触发一次检查：
+
+```bash
+code-plus-usage
+```
+
+### 自动 Full reset 会使用哪一个 credit？
+
+只在额度真实耗尽时，从详细列表中筛选 `available` credit，并使用最早到期的一个。这个排序与当前 Codex TUI 的选择逻辑一致；没有到期详情时不会盲目兑换。
 
 ### OpenTech Plus Pool 不稳定怎么办？
 
@@ -471,6 +565,7 @@ PID 1 不是 systemd 时，unit 文件即使存在也不会提供真正的服务
 
 ```bash
 pkill -TERM -x cliproxyapi
+pkill -TERM -f 'codex-plus-usage --daemon'
 ```
 
 恢复 Codex 配置备份：
@@ -500,5 +595,8 @@ cp -a /root/.codex/config.toml.pre-cliproxy-<TIMESTAMP> \
 - 一个低优先级 sorryios 备用入口
 - SSH 集群，PID 1 为 `sshd`，通过 `nohup` 维持代理进程
 - 本地管理面板仅通过 SSH tunnel 访问
+- Full reset 后遗留的本地 `usage_limit_reached` 状态自动恢复
+- 2 个带到期时间的 Full reset credit，最早到期项选择策略通过自测
+- `code-plus-usage` 终端仪表盘与 30 秒后台协调器
 
 不同版本的 CLIProxyAPI、Codex CLI 和上游中转服务可能改变字段或行为。升级前应先备份配置，并在独立终端验证个人 OAuth、每条中转线路和回退顺序。

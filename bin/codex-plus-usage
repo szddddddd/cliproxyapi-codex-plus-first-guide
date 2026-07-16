@@ -1,0 +1,871 @@
+#!/usr/bin/env node
+'use strict';
+
+const assert = require('assert');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+const CONFIG_PATH = process.env.CLIPROXY_CONFIG || '/root/.config/cliproxyapi/config.yaml';
+const AUTH_DIR = process.env.CLIPROXY_AUTH_DIR || '/root/.local/share/cliproxyapi/auths';
+const MANAGEMENT_KEY_PATH = process.env.CLIPROXY_MANAGEMENT_KEY || '/root/.config/cliproxyapi/management.key';
+const MANAGEMENT_BASE = process.env.CLIPROXY_MANAGEMENT_URL || 'http://127.0.0.1:8317';
+const RUNTIME_DIR = process.env.CLIPROXY_RUNTIME_DIR || '/root/.local/share/cliproxyapi';
+const COORDINATOR_STATE_PATH = path.join(RUNTIME_DIR, 'plus-quota-coordinator.json');
+const COORDINATOR_PID_PATH = path.join(RUNTIME_DIR, 'plus-quota-coordinator.pid');
+const COORDINATOR_LOCK_PATH = path.join(RUNTIME_DIR, 'plus-quota-coordinator.lock');
+const USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
+const RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
+const CONSUME_RESET_CREDIT_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume';
+const CURL = '/usr/bin/curl';
+
+function readText(file) {
+  return fs.readFileSync(file, 'utf8');
+}
+
+function readJson(file, fallback) {
+  try {
+    return JSON.parse(readText(file));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonAtomic(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
+  fs.chmodSync(temp, 0o600);
+  fs.renameSync(temp, file);
+}
+
+function yamlValue(value) {
+  const match = String(value).match(/^\s*(?:"([^"]*)"|'([^']*)'|(.*?))\s*(?:#.*)?$/);
+  return match ? (match[1] ?? match[2] ?? match[3] ?? '').trim() : '';
+}
+
+function parseRelayEntries(text) {
+  const lines = text.split(/\r?\n/);
+  const entries = [];
+  let inSection = false;
+  let current = null;
+  for (const line of lines) {
+    if (!inSection) {
+      if (/^codex-api-key:\s*$/.test(line)) inSection = true;
+      continue;
+    }
+    if (/^[A-Za-z0-9_-]+:\s*/.test(line)) break;
+    if (/^\s*#/.test(line) || /^\s*$/.test(line)) continue;
+    const keyMatch = line.match(/^\s*-\s*api-key:\s*(.*)$/);
+    if (keyMatch) {
+      if (current && current.key) entries.push(current);
+      current = { key: yamlValue(keyMatch[1]), priority: 0, baseUrl: '' };
+      continue;
+    }
+    if (!current) continue;
+    const priorityMatch = line.match(/^\s*priority:\s*(-?\d+)/);
+    if (priorityMatch) current.priority = Number(priorityMatch[1]);
+    const baseMatch = line.match(/^\s*base-url:\s*(.*)$/);
+    if (baseMatch) current.baseUrl = yamlValue(baseMatch[1]);
+  }
+  if (current && current.key) entries.push(current);
+  return entries;
+}
+
+function curlQuote(value) {
+  return '"' + String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, '\\n') + '"';
+}
+
+function curlRequest({ url, method = 'GET', headers = {}, body, timeout = 25, noProxy = false }) {
+  const lines = [
+    'silent',
+    'show-error',
+    'http1.1',
+    `max-time = ${timeout}`,
+    `request = ${curlQuote(method)}`,
+    `url = ${curlQuote(url)}`,
+  ];
+  if (noProxy) lines.push('noproxy = "*"');
+  for (const [name, value] of Object.entries(headers)) {
+    lines.push(`header = ${curlQuote(`${name}: ${value}`)}`);
+  }
+  if (body !== undefined) {
+    lines.push(`data = ${curlQuote(typeof body === 'string' ? body : JSON.stringify(body))}`);
+  }
+  const result = spawnSync(CURL, ['--config', '-'], {
+    input: lines.join('\n') + '\n',
+    encoding: 'utf8',
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error((result.stderr || 'curl failed').trim());
+  return result.stdout;
+}
+
+function managementRequest(key, endpoint, method = 'GET', body) {
+  const response = curlRequest({
+    url: MANAGEMENT_BASE + endpoint,
+    method,
+    headers: {
+      'X-Management-Key': key,
+      ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+    },
+    body,
+    timeout: 25,
+    noProxy: true,
+  });
+  try {
+    return JSON.parse(response);
+  } catch {
+    throw new Error(`management API returned invalid JSON for ${endpoint}`);
+  }
+}
+
+function findAuthData(entry) {
+  const candidates = [entry.path, entry.name].filter(Boolean).map(value => path.basename(value));
+  for (const candidate of candidates) {
+    const full = path.join(AUTH_DIR, candidate);
+    if (!fs.existsSync(full)) continue;
+    try {
+      const data = readJson(full, {});
+      return { accountId: data.account_id || '', email: data.email || entry.email || '' };
+    } catch {
+      // Continue to the directory scan.
+    }
+  }
+  for (const name of fs.readdirSync(AUTH_DIR)) {
+    if (!name.endsWith('.json')) continue;
+    const data = readJson(path.join(AUTH_DIR, name), {});
+    if (entry.email && data.email === entry.email) {
+      return { accountId: data.account_id || '', email: data.email || '' };
+    }
+  }
+  return { accountId: '', email: entry.email || '' };
+}
+
+function providerRequest(key, entry, authData, method, url, data) {
+  const header = {
+    Authorization: 'Bearer $TOKEN$',
+    'User-Agent': 'codex-cli',
+    ...(authData.accountId ? { 'ChatGPT-Account-Id': authData.accountId } : {}),
+    ...(data === undefined ? {} : { 'Content-Type': 'application/json' }),
+  };
+  return managementRequest(key, '/v0/management/api-call', 'POST', {
+    auth_index: entry.auth_index,
+    method,
+    url,
+    header,
+    data: data === undefined ? '' : JSON.stringify(data),
+  });
+}
+
+function parseProviderBody(response, label) {
+  const status = Number(response?.status_code || 0);
+  if (status < 200 || status >= 300) throw new Error(`${label} returned HTTP ${status || 'unknown'}`);
+  try {
+    return JSON.parse(response.body || '{}');
+  } catch {
+    throw new Error(`${label} returned invalid JSON`);
+  }
+}
+
+function maskEmail(email) {
+  if (!email || !email.includes('@')) return 'unknown account';
+  const [local, domain] = email.split('@');
+  return `${local.slice(0, 1)}***@${domain}`;
+}
+
+function fingerprint(value) {
+  return crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 10);
+}
+
+function normalizeUrl(value) {
+  return String(value || '').replace(/\/+$/, '').toLowerCase();
+}
+
+function relayLabel(entry) {
+  const base = normalizeUrl(entry.baseUrl);
+  if (base.includes('api.opentech.top') && entry.priority === -10) return 'OpenTech Plus';
+  if (base.includes('api.opentech.top') && entry.priority === -20) return 'OpenTech Pro';
+  if (base.includes('sorryios.ai')) return 'sorryios fallback';
+  return `relay priority ${entry.priority}`;
+}
+
+function findUsageForRelay(usage, relay) {
+  const provider = usage && usage.codex;
+  if (!provider) return null;
+  const exact = `${relay.baseUrl}|${relay.key}`;
+  if (provider[exact]) return provider[exact];
+  const targetBase = normalizeUrl(relay.baseUrl);
+  for (const [composite, value] of Object.entries(provider)) {
+    const split = composite.indexOf('|');
+    if (split < 0) continue;
+    if (normalizeUrl(composite.slice(0, split)) === targetBase && composite.slice(split + 1) === relay.key) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function sumRecent(recent) {
+  return (recent || []).reduce((sum, item) => ({
+    success: sum.success + Number(item.success || 0),
+    failed: sum.failed + Number(item.failed || 0),
+  }), { success: 0, failed: 0 });
+}
+
+function expiryMillis(credit) {
+  if (!credit?.expires_at) return Number.POSITIVE_INFINITY;
+  const parsed = Date.parse(credit.expires_at);
+  return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY;
+}
+
+function availableCredits(details) {
+  return (Array.isArray(details?.credits) ? details.credits : [])
+    .filter(credit => String(credit.status || '').toLowerCase() === 'available')
+    .sort((left, right) => expiryMillis(left) - expiryMillis(right));
+}
+
+function selectEarliestCredit(details) {
+  return availableCredits(details)[0] || null;
+}
+
+function upstreamReady(usage) {
+  const rateLimit = usage?.rate_limit;
+  return Boolean(rateLimit && rateLimit.allowed === true && rateLimit.limit_reached !== true);
+}
+
+function limitReached(usage) {
+  const rateLimit = usage?.rate_limit;
+  if (!rateLimit) return false;
+  if (rateLimit.limit_reached === true || rateLimit.allowed === false) return true;
+  return [rateLimit.primary_window, rateLimit.secondary_window]
+    .filter(Boolean)
+    .some(window => Number(window.used_percent) >= 100);
+}
+
+function localRecoveryNeeded(entry, usage) {
+  if (!upstreamReady(usage)) return false;
+  const message = String(entry.status_message || '').toLowerCase();
+  const staleQuotaError = /usage_limit|rate.?limit|quota|too many requests|\b429\b/.test(message);
+  return staleQuotaError && (
+    String(entry.status || '').toLowerCase() !== 'active'
+    || Boolean(entry.unavailable)
+    || Boolean(entry.next_retry_after)
+  );
+}
+
+function emptyCoordinatorState() {
+  return {
+    version: 1,
+    auto_reset_enabled: true,
+    policy: 'consume_at_limit_earliest_expiry',
+    daemon_interval_seconds: 30,
+    last_check: null,
+    last_action: null,
+    last_error: null,
+    pending: {},
+  };
+}
+
+function loadCoordinatorState() {
+  const state = readJson(COORDINATOR_STATE_PATH, emptyCoordinatorState());
+  return {
+    ...emptyCoordinatorState(),
+    ...state,
+    pending: state?.pending && typeof state.pending === 'object' ? state.pending : {},
+  };
+}
+
+function saveCoordinatorState(state) {
+  writeJsonAtomic(COORDINATOR_STATE_PATH, state);
+}
+
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function coordinatorStatus() {
+  const pid = Number(readTextSafe(COORDINATOR_PID_PATH).trim());
+  return { running: processAlive(pid), pid: Number.isInteger(pid) ? pid : null };
+}
+
+function readTextSafe(file) {
+  try {
+    return readText(file);
+  } catch {
+    return '';
+  }
+}
+
+function acquireLock() {
+  fs.mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(COORDINATOR_LOCK_PATH, 'wx', 0o600);
+      fs.writeFileSync(fd, `${process.pid}\n`);
+      fs.closeSync(fd);
+      return true;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const owner = Number(readTextSafe(COORDINATOR_LOCK_PATH).trim());
+      if (processAlive(owner)) return false;
+      try { fs.unlinkSync(COORDINATOR_LOCK_PATH); } catch { /* retry */ }
+    }
+  }
+  return false;
+}
+
+function releaseLock() {
+  const owner = Number(readTextSafe(COORDINATOR_LOCK_PATH).trim());
+  if (owner === process.pid) {
+    try { fs.unlinkSync(COORDINATOR_LOCK_PATH); } catch { /* already removed */ }
+  }
+}
+
+function loadRuntime(includeRelayUsage = true) {
+  const config = readText(CONFIG_PATH);
+  const key = readText(MANAGEMENT_KEY_PATH).trim();
+  if (!key) throw new Error(`management key file is empty: ${MANAGEMENT_KEY_PATH}`);
+  const authResponse = managementRequest(key, '/v0/management/auth-files');
+  const oauthEntries = (authResponse.files || []).filter(entry => {
+    const provider = String(entry.provider || entry.type || '').toLowerCase();
+    return provider === 'codex' && String(entry.account_type || '').toLowerCase() === 'oauth';
+  });
+  const accounts = oauthEntries.map(entry => {
+    const authData = findAuthData(entry);
+    const account = { entry, authData, usage: null, creditDetails: null, error: null, creditError: null };
+    try {
+      account.usage = parseProviderBody(
+        providerRequest(key, entry, authData, 'GET', USAGE_URL),
+        'ChatGPT usage',
+      );
+    } catch (error) {
+      account.error = error.message;
+      return account;
+    }
+    try {
+      account.creditDetails = parseProviderBody(
+        providerRequest(key, entry, authData, 'GET', RESET_CREDITS_URL),
+        'reset credits',
+      );
+    } catch (error) {
+      account.creditError = error.message;
+    }
+    return account;
+  });
+  return {
+    key,
+    accounts,
+    relays: parseRelayEntries(config),
+    apiKeyUsage: includeRelayUsage
+      ? managementRequest(key, '/v0/management/api-key-usage')
+      : {},
+  };
+}
+
+function resetLocalQuota(runtime, account) {
+  const response = managementRequest(runtime.key, '/v0/management/reset-quota', 'POST', {
+    auth_index: account.entry.auth_index,
+  });
+  if (response.status !== 'ok') throw new Error('CLIProxyAPI rejected local quota reset');
+  account.entry.status = 'active';
+  account.entry.status_message = '';
+  account.entry.unavailable = false;
+  account.entry.next_retry_after = null;
+}
+
+function safeAction(type, account, extra = {}) {
+  return {
+    at: new Date().toISOString(),
+    type,
+    account: maskEmail(account.authData.email || account.entry.email),
+    ...extra,
+  };
+}
+
+function rememberError(state, message) {
+  const changed = state.last_error?.message !== message;
+  state.last_error = { at: new Date().toISOString(), message };
+  return changed;
+}
+
+function reconcileAccount(runtime, account, state, log) {
+  const accountKey = String(account.entry.auth_index || '');
+  if (!accountKey) throw new Error('OAuth auth index is missing');
+  if (account.error || !account.usage) throw new Error(account.error || 'ChatGPT usage is unavailable');
+
+  if (upstreamReady(account.usage)) {
+    let changed = false;
+    if (localRecoveryNeeded(account.entry, account.usage)) {
+      resetLocalQuota(runtime, account);
+      state.last_action = safeAction('local_state_recovered', account, {
+        message: 'Upstream quota is healthy; stale local error/cooldown was cleared.',
+      });
+      log(`recovered stale local OAuth state for ${state.last_action.account}`);
+      changed = true;
+    }
+    if (state.pending[accountKey]) {
+      delete state.pending[accountKey];
+      changed = true;
+    }
+    return changed;
+  }
+
+  if (!limitReached(account.usage)) return false;
+  const candidates = availableCredits(account.creditDetails);
+  const availableCount = Number(
+    account.creditDetails?.available_count
+      ?? account.usage?.rate_limit_reset_credits?.available_count
+      ?? 0,
+  );
+  let pending = state.pending[accountKey];
+  if (!pending) {
+    if (availableCount > candidates.length) {
+      throw new Error(`reset credit details are incomplete (${candidates.length}/${availableCount}); automatic redemption was skipped`);
+    }
+    const selected = selectEarliestCredit(account.creditDetails);
+    if (!selected) {
+      if (availableCount > 0) {
+        throw new Error('reset credits exist but expiry details are unavailable; automatic redemption was skipped');
+      }
+      return false;
+    }
+    pending = {
+      credit_id: selected.id,
+      credit_fingerprint: fingerprint(selected.id),
+      expires_at: selected.expires_at || null,
+      redeem_request_id: crypto.randomUUID(),
+      created_at: new Date().toISOString(),
+    };
+    state.pending[accountKey] = pending;
+    saveCoordinatorState(state);
+  } else if (candidates.length && !candidates.some(credit => credit.id === pending.credit_id)) {
+    log(`retrying pending reset ${pending.credit_fingerprint}; it is no longer listed as available`);
+  }
+
+  const response = providerRequest(
+    runtime.key,
+    account.entry,
+    account.authData,
+    'POST',
+    CONSUME_RESET_CREDIT_URL,
+    { redeem_request_id: pending.redeem_request_id, credit_id: pending.credit_id },
+  );
+  const result = parseProviderBody(response, 'reset credit consume');
+  const code = String(result.code || '').toLowerCase();
+  if (['reset', 'nothing_to_reset', 'already_redeemed'].includes(code)) {
+    resetLocalQuota(runtime, account);
+    delete state.pending[accountKey];
+    state.last_action = safeAction('full_reset_consumed', account, {
+      message: `Full reset result: ${code}.`,
+      credit_fingerprint: pending.credit_fingerprint,
+      expires_at: pending.expires_at,
+      windows_reset: Number(result.windows_reset || 0),
+    });
+    log(`consumed earliest-expiring Full reset ${pending.credit_fingerprint} for ${state.last_action.account} (${code})`);
+    return true;
+  }
+  if (code === 'no_credit') {
+    delete state.pending[accountKey];
+    throw new Error('backend reported that no Full reset credit is available');
+  }
+  throw new Error(`unexpected reset credit response: ${code || 'unknown'}`);
+}
+
+function reconcileAll(log = () => {}) {
+  if (!acquireLock()) return { busy: true, changed: false };
+  try {
+    const runtime = loadRuntime(false);
+    if (!runtime.accounts.length) throw new Error('no Codex OAuth account was found');
+    const state = loadCoordinatorState();
+    let changed = false;
+    let hadError = false;
+    for (const account of runtime.accounts) {
+      try {
+        changed = reconcileAccount(runtime, account, state, log) || changed;
+      } catch (error) {
+        hadError = true;
+        const message = `${maskEmail(account.authData.email || account.entry.email)}: ${error.message}`;
+        if (rememberError(state, message)) log(`ERROR ${message}`);
+      }
+    }
+    state.last_check = new Date().toISOString();
+    if (!hadError) state.last_error = null;
+    saveCoordinatorState(state);
+    return { busy: false, changed };
+  } finally {
+    releaseLock();
+  }
+}
+
+function sanitizedCredits(account) {
+  const credits = availableCredits(account.creditDetails).map(credit => ({
+    reset_type: credit.reset_type || null,
+    status: credit.status || null,
+    granted_at: credit.granted_at || null,
+    expires_at: credit.expires_at || null,
+    title: credit.title || null,
+  }));
+  const availableCount = Number(
+    account.creditDetails?.available_count
+      ?? account.usage?.rate_limit_reset_credits?.available_count
+      ?? 0,
+  );
+  return { available_count: availableCount, credits, next: credits[0] || null };
+}
+
+function loadSnapshot() {
+  const runtime = loadRuntime(true);
+  const state = loadCoordinatorState();
+  const personal = runtime.accounts.map(account => {
+    const recent = sumRecent(account.entry.recent_requests);
+    return {
+      account: maskEmail(account.authData.email || account.entry.email),
+      plan: account.usage?.plan_type || null,
+      local_status: account.entry.status || 'unknown',
+      local_unavailable: Boolean(account.entry.unavailable),
+      local_status_message: account.entry.status_message ? 'present' : null,
+      upstream_ready: upstreamReady(account.usage),
+      allowed: account.usage?.rate_limit?.allowed ?? null,
+      limit_reached: account.usage?.rate_limit?.limit_reached ?? null,
+      primary: account.usage?.rate_limit?.primary_window || null,
+      secondary: account.usage?.rate_limit?.secondary_window || null,
+      reset_credits: sanitizedCredits(account),
+      success: Number(account.entry.success || 0),
+      failed: Number(account.entry.failed || 0),
+      recent_success: recent.success,
+      recent_failed: recent.failed,
+      error: account.error || null,
+      credit_error: account.creditError || null,
+    };
+  });
+  const relays = runtime.relays.map(relay => {
+    const item = findUsageForRelay(runtime.apiKeyUsage, relay);
+    const recent = sumRecent(item?.recent_requests);
+    return {
+      name: relayLabel(relay),
+      priority: relay.priority,
+      base_url: relay.baseUrl,
+      success: Number(item?.success || 0),
+      failed: Number(item?.failed || 0),
+      recent_success: recent.success,
+      recent_failed: recent.failed,
+      loaded: Boolean(item),
+    };
+  });
+  const daemon = coordinatorStatus();
+  return {
+    timestamp: new Date().toISOString(),
+    personal,
+    relays,
+    route: personal.some(account => account.upstream_ready && account.local_status === 'active' && !account.local_unavailable)
+      ? 'personal_plus'
+      : 'relay_fallback',
+    automation: {
+      enabled: state.auto_reset_enabled !== false,
+      policy: state.policy,
+      daemon_running: daemon.running,
+      daemon_pid: daemon.running ? daemon.pid : null,
+      interval_seconds: state.daemon_interval_seconds,
+      last_check: state.last_check,
+      last_action: state.last_action ? {
+        at: state.last_action.at,
+        type: state.last_action.type,
+        account: state.last_action.account,
+        message: state.last_action.message,
+        expires_at: state.last_action.expires_at || null,
+        windows_reset: state.last_action.windows_reset ?? null,
+      } : null,
+      last_error: state.last_error,
+      pending: Object.values(state.pending || {}).map(item => ({
+        expires_at: item.expires_at,
+        created_at: item.created_at,
+      })),
+    },
+  };
+}
+
+function formatDuration(seconds) {
+  let value = Math.max(0, Math.round(Number(seconds) || 0));
+  const days = Math.floor(value / 86400); value %= 86400;
+  const hours = Math.floor(value / 3600); value %= 3600;
+  const minutes = Math.floor(value / 60);
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function formatDate(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return 'unknown';
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false, timeZoneName: 'short',
+  }).format(date);
+}
+
+function windowLabel(seconds) {
+  const value = Number(seconds) || 0;
+  if (value > 0 && value <= 6 * 3600) return '5h';
+  if (value > 6 * 86400 && value <= 8 * 86400) return '7d';
+  return value ? formatDuration(value) : 'quota';
+}
+
+function colorizer(enabled) {
+  const wrap = code => value => enabled ? `\x1b[${code}m${value}\x1b[0m` : String(value);
+  return {
+    bold: wrap('1'), dim: wrap('2'), red: wrap('31'), green: wrap('32'),
+    yellow: wrap('33'), cyan: wrap('36'),
+  };
+}
+
+function stripAnsi(value) {
+  return String(value).replace(/\x1b\[[0-9;]*m/g, '');
+}
+
+function pad(value, width) {
+  const text = String(value);
+  return text + ' '.repeat(Math.max(0, width - stripAnsi(text).length));
+}
+
+function quotaBar(usedPercent, colors, width = 30) {
+  const used = Math.min(100, Math.max(0, Number(usedPercent) || 0));
+  const filled = Math.round((used / 100) * width);
+  const content = '#'.repeat(filled) + '-'.repeat(width - filled);
+  const paint = used >= 90 ? colors.red : used >= 70 ? colors.yellow : colors.green;
+  return `[${paint(content)}]`;
+}
+
+function statusTag(label, tone, colors) {
+  const paint = tone === 'good' ? colors.green : tone === 'warn' ? colors.yellow : colors.red;
+  return paint(`[${label}]`);
+}
+
+function printWindow(window, colors, missingLabel = 'window') {
+  if (!window) return `  ${pad(missingLabel, 8)} ${colors.dim('not reported by upstream')}`;
+  const used = Number(window.used_percent || 0);
+  const reset = window.reset_after_seconds !== undefined
+    ? `reset in ${formatDuration(window.reset_after_seconds)}`
+    : window.reset_at ? `reset ${formatDate(Number(window.reset_at) * 1000)}` : 'reset unknown';
+  return `  ${pad(windowLabel(window.limit_window_seconds), 8)} ${quotaBar(used, colors)}  ${pad(`${used}% used`, 10)} ${pad(`${Math.max(0, 100 - used)}% left`, 11)} ${colors.dim(reset)}`;
+}
+
+function printSnapshot(snapshot, options) {
+  const colors = colorizer(options.color);
+  const width = Math.max(76, Math.min(110, process.stdout.columns || 96));
+  const rule = '-'.repeat(width);
+  console.log(colors.cyan(colors.bold('CODEX PLUS-FIRST STATUS')) + `  ${colors.dim(formatDate(snapshot.timestamp))}`);
+  console.log(rule);
+  console.log(`${colors.bold('当前路由')}  ${snapshot.route === 'personal_plus'
+    ? statusTag('PERSONAL PLUS', 'good', colors)
+    : statusTag('RELAY FALLBACK', 'warn', colors)}`);
+
+  console.log('');
+  console.log(colors.bold('PERSONAL CHATGPT PLUS'));
+  if (!snapshot.personal.length) console.log(`  ${statusTag('MISSING', 'bad', colors)} No OAuth account found.`);
+  for (const account of snapshot.personal) {
+    const ready = account.upstream_ready && account.local_status === 'active' && !account.local_unavailable;
+    const tag = ready ? statusTag('READY', 'good', colors) : statusTag('BLOCKED', 'bad', colors);
+    console.log(`  ${tag} ${colors.bold(account.account)}  plan=${String(account.plan || 'unknown').toUpperCase()}  local=${account.local_status}`);
+    if (account.error) {
+      console.log(`  ${colors.red('ERROR')} ${account.error}`);
+      continue;
+    }
+    console.log(printWindow(account.primary, colors, 'primary'));
+    console.log(printWindow(account.secondary, colors, '5h'));
+    const next = account.reset_credits.next;
+    const nextText = next?.expires_at ? `${formatDate(next.expires_at)} (${formatDuration((Date.parse(next.expires_at) - Date.now()) / 1000)} left)` : 'no expiry detail';
+    console.log(`  ${pad('resets', 8)} ${colors.cyan(`${account.reset_credits.available_count} Full reset credit(s)`)}${next ? `  next: ${nextText}` : ''}`);
+    console.log(`  ${pad('requests', 8)} total ${account.success} ok / ${account.failed} failed  |  last ~200m ${account.recent_success} ok / ${account.recent_failed} failed`);
+  }
+
+  console.log('');
+  console.log(colors.bold('ROUTING COUNTERS'));
+  console.log(`  ${pad('PRIO', 7)}${pad('ROUTE', 22)}${pad('ROLE', 13)}${pad('TOTAL', 20)}RECENT ~200M`);
+  const personalSuccess = snapshot.personal.reduce((sum, item) => sum + item.success, 0);
+  const personalFailed = snapshot.personal.reduce((sum, item) => sum + item.failed, 0);
+  const personalRecentSuccess = snapshot.personal.reduce((sum, item) => sum + item.recent_success, 0);
+  const personalRecentFailed = snapshot.personal.reduce((sum, item) => sum + item.recent_failed, 0);
+  console.log(`  ${pad('0', 7)}${pad('Personal Plus', 22)}${pad(snapshot.route === 'personal_plus' ? 'PRIMARY' : 'BLOCKED', 13)}${pad(`${personalSuccess} ok / ${personalFailed} fail`, 20)}${personalRecentSuccess} ok / ${personalRecentFailed} fail`);
+  snapshot.relays.forEach((relay, index) => {
+    const role = `FALLBACK ${index + 1}`;
+    const totals = relay.loaded ? `${relay.success} ok / ${relay.failed} fail` : 'not loaded';
+    console.log(`  ${pad(relay.priority, 7)}${pad(relay.name, 22)}${pad(role, 13)}${pad(totals, 20)}${relay.recent_success} ok / ${relay.recent_failed} fail`);
+  });
+  console.log(`  ${colors.dim('Relay counters are local routing health, not provider balance or billing.')}`);
+
+  console.log('');
+  console.log(colors.bold('AUTOMATION'));
+  console.log(`  ${snapshot.automation.enabled ? statusTag('ON', 'good', colors) : statusTag('OFF', 'bad', colors)} Full reset only at an actual limit; earliest expiry first.`);
+  console.log(`  ${snapshot.automation.daemon_running ? statusTag('RUNNING', 'good', colors) : statusTag('STOPPED', 'warn', colors)} coordinator  interval=${snapshot.automation.interval_seconds}s${snapshot.automation.last_check ? `  last check ${formatDate(snapshot.automation.last_check)}` : ''}`);
+  if (snapshot.automation.last_action) {
+    console.log(`  ${colors.cyan('last action')} ${formatDate(snapshot.automation.last_action.at)}  ${snapshot.automation.last_action.message}`);
+  }
+  if (snapshot.automation.last_error) {
+    console.log(`  ${colors.red('last error')}  ${formatDate(snapshot.automation.last_error.at)}  ${snapshot.automation.last_error.message}`);
+  }
+  console.log(rule);
+}
+
+function parseArgs(argv) {
+  const options = {
+    watch: false,
+    daemon: false,
+    json: false,
+    readOnly: false,
+    selfTest: false,
+    help: false,
+    interval: null,
+    color: process.stdout.isTTY && !process.env.NO_COLOR,
+  };
+  for (const arg of argv) {
+    if (arg === '--watch') options.watch = true;
+    else if (arg.startsWith('--watch=')) { options.watch = true; options.interval = Number(arg.slice(8)); }
+    else if (arg === '--daemon') options.daemon = true;
+    else if (arg.startsWith('--interval=')) options.interval = Number(arg.slice(11));
+    else if (arg === '--json') options.json = true;
+    else if (arg === '--read-only') options.readOnly = true;
+    else if (arg === '--self-test') options.selfTest = true;
+    else if (arg === '--no-color') options.color = false;
+    else if (arg === '--help' || arg === '-h') options.help = true;
+    else throw new Error(`unknown argument: ${arg}`);
+  }
+  const defaultInterval = options.daemon ? 30 : 15;
+  options.interval = Number.isFinite(options.interval) && options.interval >= 2
+    ? options.interval
+    : defaultInterval;
+  return options;
+}
+
+function printHelp() {
+  console.log(`Usage: codex-plus-usage [options]\n\nOptions:\n  --watch[=SECONDS]  Refresh the terminal dashboard (default: 15s)\n  --daemon           Run quota recovery and reset-credit coordination\n  --interval=SECONDS Set daemon/watch interval\n  --json             Print a sanitized JSON snapshot\n  --read-only        Do not heal state or consume reset credits\n  --no-color         Disable ANSI colors\n  --self-test        Run local policy tests\n  -h, --help         Show this help`);
+}
+
+function runSelfTest() {
+  const details = {
+    credits: [
+      { id: 'late', status: 'available', expires_at: '2026-07-31T00:00:00Z' },
+      { id: 'used', status: 'redeemed', expires_at: '2026-07-01T00:00:00Z' },
+      { id: 'early', status: 'available', expires_at: '2026-07-27T00:00:00Z' },
+      { id: 'never', status: 'available', expires_at: null },
+    ],
+  };
+  assert.strictEqual(selectEarliestCredit(details).id, 'early');
+  assert.strictEqual(limitReached({ rate_limit: { allowed: true, limit_reached: false, primary_window: { used_percent: 0 } } }), false);
+  assert.strictEqual(limitReached({ rate_limit: { allowed: false, limit_reached: true } }), true);
+  assert.strictEqual(localRecoveryNeeded({ status: 'error', status_message: 'usage_limit_reached', unavailable: false }, { rate_limit: { allowed: true, limit_reached: false } }), true);
+  assert.strictEqual(localRecoveryNeeded({ status: 'error', status_message: 'invalid model', unavailable: true }, { rate_limit: { allowed: true, limit_reached: false } }), false);
+  assert.strictEqual(localRecoveryNeeded({ status: 'active', status_message: '', unavailable: false }, { rate_limit: { allowed: true, limit_reached: false } }), false);
+  const sanitized = details.credits.map(credit => ({ fingerprint: fingerprint(credit.id) }));
+  assert(!JSON.stringify(sanitized).includes('early'));
+  console.log('self-test: 7 checks passed');
+}
+
+function acquireDaemonPid() {
+  const existing = Number(readTextSafe(COORDINATOR_PID_PATH).trim());
+  if (processAlive(existing) && existing !== process.pid) {
+    throw new Error(`coordinator already running with PID ${existing}`);
+  }
+  fs.writeFileSync(COORDINATOR_PID_PATH, `${process.pid}\n`, { mode: 0o600 });
+  fs.chmodSync(COORDINATOR_PID_PATH, 0o600);
+}
+
+function releaseDaemonPid() {
+  const owner = Number(readTextSafe(COORDINATOR_PID_PATH).trim());
+  if (owner === process.pid) {
+    try { fs.unlinkSync(COORDINATOR_PID_PATH); } catch { /* already removed */ }
+  }
+}
+
+function sleep(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function runDaemon(options) {
+  acquireDaemonPid();
+  let stopped = false;
+  let wake = null;
+  const stop = () => {
+    stopped = true;
+    if (wake) wake();
+  };
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+  const state = loadCoordinatorState();
+  state.daemon_interval_seconds = options.interval;
+  saveCoordinatorState(state);
+  const log = message => console.log(`[${new Date().toISOString()}] ${message}`);
+  log(`coordinator started; interval=${options.interval}s; policy=earliest-expiry-at-limit`);
+  try {
+    while (!stopped) {
+      try {
+        reconcileAll(log);
+      } catch (error) {
+        const current = loadCoordinatorState();
+        if (rememberError(current, error.message)) log(`ERROR ${error.message}`);
+        current.last_check = new Date().toISOString();
+        saveCoordinatorState(current);
+      }
+      if (!stopped) {
+        await new Promise(resolve => {
+          const timer = setTimeout(() => {
+            wake = null;
+            resolve();
+          }, options.interval * 1000);
+          wake = () => {
+            clearTimeout(timer);
+            wake = null;
+            resolve();
+          };
+        });
+      }
+    }
+  } finally {
+    releaseDaemonPid();
+    releaseLock();
+    log('coordinator stopped');
+  }
+}
+
+async function runDashboard(options) {
+  let stopped = false;
+  const stop = () => { stopped = true; };
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+  do {
+    try {
+      if (!options.readOnly) reconcileAll();
+      const snapshot = loadSnapshot();
+      if (options.watch && process.stdout.isTTY) process.stdout.write('\x1b[2J\x1b[H');
+      if (options.json) console.log(JSON.stringify(snapshot));
+      else printSnapshot(snapshot, options);
+    } catch (error) {
+      if (options.watch && process.stdout.isTTY) process.stdout.write('\x1b[2J\x1b[H');
+      console.error(`Unable to read usage: ${error.message}`);
+    }
+    if (!options.watch || stopped) break;
+    await sleep(options.interval * 1000);
+  } while (!stopped);
+}
+
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
+  if (options.help) return printHelp();
+  if (options.selfTest) return runSelfTest();
+  if (options.daemon) return runDaemon(options);
+  return runDashboard(options);
+}
+
+main().catch(error => {
+  console.error(error.message);
+  process.exitCode = 1;
+});
