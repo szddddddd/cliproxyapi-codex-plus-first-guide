@@ -817,9 +817,9 @@ function pad(value, width) {
 
 function quotaBar(usedPercent, colors, width = 30) {
   const used = Math.min(100, Math.max(0, Number(usedPercent) || 0));
-  const filled = used > 0 ? Math.max(1, Math.round((used / 100) * width)) : 0;
-  const paint = used >= 90 ? colors.red : used >= 70 ? colors.yellow : colors.green;
-  return `${colors.gray('│')}${paint('█'.repeat(filled))}${colors.gray('░'.repeat(width - filled))}${colors.gray('│')}`;
+  const grayBlocks = used > 0 ? Math.max(1, Math.round((used / 100) * width)) : 0;
+  const greenBlocks = width - grayBlocks;
+  return `${colors.gray('│')}${colors.green('█'.repeat(greenBlocks))}${colors.gray('░'.repeat(grayBlocks))}${colors.gray('│')}`;
 }
 
 function statusTag(label, tone, colors) {
