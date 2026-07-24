@@ -315,7 +315,8 @@ remote-management:
 
 ### systemd 环境
 
-在 systemd 是 PID 1 的常规 Linux 机器上，可创建 `/etc/systemd/system/cliproxyapi.service`：
+在 systemd 是 PID 1 的常规 Linux 机器上，可创建 `/etc/systemd/system/cliproxyapi.service`。
+如果需要通过出站代理访问上游 API，同时避免本地回环地址走代理，应配置 `Environment=` 并包含 `NO_PROXY`：
 
 ```ini
 [Unit]
@@ -332,10 +333,17 @@ ExecStart=/usr/local/bin/cliproxyapi -config /root/.config/cliproxyapi/config.ya
 Restart=on-failure
 RestartSec=3
 UMask=0077
+Environment=HTTP_PROXY=http://<OUTBOUND_PROXY>:<PORT>
+Environment=HTTPS_PROXY=http://<OUTBOUND_PROXY>:<PORT>
+Environment=NO_PROXY=localhost,127.0.0.1
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+> **注意**：`NO_PROXY` 必须包含 `localhost,127.0.0.1`，否则 cliproxyapi 内部转发时可能将回路地址也路由到出站代理。
+> cliproxyapi 自身的 `config.yaml` 中已有 `proxy-url` 字段，不需要依赖环境变量代理；
+> 但 systemd 的 `Environment=` 会传递给子进程，遗漏 `NO_PROXY` 可能影响其他行为。
 
 ```bash
 systemctl daemon-reload
@@ -357,9 +365,14 @@ echo $! > /root/.local/share/cliproxyapi/cliproxyapi.pid
 chmod 600 /root/.local/share/cliproxyapi/cliproxyapi.pid
 ```
 
-也可以在 SSH shell 启动脚本中加入“进程不存在才启动”的检查：
+也可以在 SSH shell 启动脚本中加入"进程不存在才启动"的检查。
+**注意：脚本中必须确保 `no_proxy` 包含 `localhost,127.0.0.1`**，否则 cliproxyapi 的 HTTP 客户端可能会
+把本地请求路由到出站代理。
 
 ```bash
+export no_proxy="localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.svc,.cluster.local"
+export NO_PROXY="$no_proxy"
+
 if command -v cliproxyapi >/dev/null 2>&1 && ! pgrep -x cliproxyapi >/dev/null 2>&1; then
     env -u OPENAI_BASE_URL -u OPENAI_API_KEY -u CODEX_API_KEY \
         nohup /usr/local/bin/cliproxyapi \
@@ -713,6 +726,22 @@ code-plus-usage
 
 只在额度真实耗尽时，从详细列表中筛选 `available` credit，并使用最早到期的一个。这个排序与当前 Codex TUI 的选择逻辑一致；没有到期详情时不会盲目兑换。
 
+### 为什么 `codex` 交互模式出现 Cloudflare 400 或 502 错误？
+
+如果 `codex`（交互模式）返回 `400 The plain HTTP request was sent to HTTPS port`（来自 Cloudflare）
+或 `502 Bad Gateway`，通常是 **`codex app-server` 没有 `no_proxy` 环境变量** 导致的。
+
+Codex 交互模式会启动一个后台 `codex app-server` 进程。该进程继承 shell 的环境变量。如果
+`http_proxy` 已设置但 `no_proxy` 为空或没有包含 `127.0.0.1`，app-server 连接本地 `127.0.0.1:8317`
+（cliproxyapi）时会把请求路由到出站代理，而出站代理无法连接到你机器的 localhost。
+
+**解决方法**：
+1. 确保 shell 的 `no_proxy` 包含 `localhost,127.0.0.1`
+2. 杀死已启动的旧 app-server：`pkill -f 'codex app-server'`
+3. 重新运行 `codex`（会自动启动新 app-server，继承正确的环境变量）
+
+如果使用 systemd unit 管理 cliproxyapi，也请确保 `NO_PROXY` 已设置（参见第 5 节）。
+
 ### OpenTech Plus Pool 不稳定怎么办？
 
 保持 Plus Pool 为 `-10`、Pro Pool 为 `-20`，并让冷却和跨凭据重试生效。先直接验证 Pro Pool 的 key 和 base URL 可用，再判断是 Plus Pool 波动、集群出站代理问题还是 CLIProxyAPI 配置问题。
@@ -797,6 +826,62 @@ exit 1
 迁移到独立 `client.key` 时，应先把新 key 加入 `config.yaml`，验证新 helper 可以访问 `/v1/models`，再删除历史
 client key，避免一次性修改造成 Codex 无法连接本地代理。
 
+### 2026-07-24 审计更新
+
+#### 集群出站代理的 `no_proxy` 配置
+
+当前机器的 `.zshrc` 已取消注释出站代理配置并包含完整的 `no_proxy`：
+
+```bash
+export http_proxy="http://10.19.125.136:12000"
+export https_proxy="http://10.19.125.136:12000"
+export HTTP_PROXY="$http_proxy"
+export HTTPS_PROXY="$https_proxy"
+export all_proxy="http://10.19.125.136:12000"
+export ALL_PROXY="http://10.19.125.136:12000"
+export no_proxy="localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.svc,.cluster.local"
+export NO_PROXY="$no_proxy"
+```
+
+**如果没有 `no_proxy`，`codex` 访问本地 `127.0.0.1:8317`（cliproxyapi）的请求会被错误路由到出站代理**，
+导致 502 Bad Gateway 或 400 Cloudflare 错误。
+
+#### `codex app-server` 环境变量继承
+
+Codex 交互模式（`codex`，不加子命令）会启动一个后台 `codex app-server --listen unix://` 进程。
+该进程继承 shell 的环境变量。如果 app-server 在 `no_proxy` 就绪前启动，它发出的到 `127.0.0.1:8317` 的请求会通过代理，
+导致 `400 The plain HTTP request was sent to HTTPS port`（Cloudflare）错误。
+
+**解决方法**：杀死旧 app-server，然后重新进入交互模式：
+
+```bash
+pkill -f 'codex app-server'
+# 确认 no_proxy 已设置
+echo $no_proxy
+# 重新进入交互模式（会自动启动新 app-server）
+codex
+```
+
+新机器的 `.zshrc` 应在 `cliproxyapi` 和额度协调器的补启动块之前设置 `no_proxy`。
+
+#### systemd unit 缺少 `no_proxy`
+
+`/etc/systemd/system/cliproxyapi.service` 的 `[Service]` 段配置了 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，
+但**没有设置 `no_proxy`**。自建 unit 时应补充：
+
+```ini
+Environment=NO_PROXY=localhost,127.0.0.1
+```
+
+#### MCP 服务器 `openaiDeveloperDocs` 被代理屏蔽
+
+`~/.codex/config.toml` 中配置了 MCP 服务器指向 `https://developers.openai.com/mcp`，
+集群出站代理禁止访问该域名，返回 HTTP 403。此错误不影响主 API 调用。如不需要可删除该 MCP 配置。
+
+#### Codex 版本
+
+当前机器已升级到 `codex-cli 0.145.0`。升级后交互模式通过 app-server 代理请求，需确保 `no_proxy` 正确传递。
+
 ## 参考
 
 - [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
@@ -816,7 +901,7 @@ client key，避免一次性修改造成 Codex 无法连接本地代理。
 - OpenTech Codex Plus Pool 与 Pro Pool
 - TAI OpenAI-compatible `glm-5.2` 成功请求
 - GPT 挡位下 `tai-glm disabled=true`，两个 GLM ID 从 `/v1/models` 消失
-- GLM 挡位开启后两个 GLM ID 重新注册，且不存在 GLM → GPT 同名别名回退
+- GLM 挡位开启后两个 GLM ID 再次注册，且不存在 GLM → GPT 同名别名回退
 - `glm-5.2-fast` 上游不可用时直接报错，不跨模型家族回退
 - 一个低优先级 sorryios 备用入口
 - SSH 集群，PID 1 为 `sshd`，通过 `nohup` 维持代理进程
@@ -824,5 +909,6 @@ client key，避免一次性修改造成 Codex 无法连接本地代理。
 - Full reset 后遗留的本地 `usage_limit_reached` 状态自动恢复
 - 2 个带到期时间的 Full reset credit，最早到期项选择策略通过自测
 - `code-plus-usage` 代理硬门控、GPT / GLM 持久挡位切换与 30 秒后台协调器
+- **`no_proxy` 环境变量修复**：`codex app-server` 继承 `no_proxy` 避免本地路由走代理（2026-07-24 新增）
 
 不同版本的 CLIProxyAPI、Codex CLI 和上游中转服务可能改变字段或行为。升级前应先备份配置，并在独立终端验证个人 OAuth、每条中转线路和回退顺序。
