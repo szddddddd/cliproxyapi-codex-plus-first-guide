@@ -882,6 +882,86 @@ Environment=NO_PROXY=localhost,127.0.0.1
 
 当前机器已升级到 `codex-cli 0.145.0`。升级后交互模式通过 app-server 代理请求，需确保 `no_proxy` 正确传递。
 
+#### `.zshenv` 缺少 `no_proxy`
+
+当前机器的 `~/.zshenv` 配置了代理环境变量，但 **没有设置 `no_proxy`**：
+
+```bash
+# ~/.zshenv — 当前内容
+export HTTP_PROXY="http://10.19.125.136:12000"
+export HTTPS_PROXY="http://10.19.125.136:12000"
+export ALL_PROXY="http://10.19.125.136:12000"
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTPS_PROXY"
+export all_proxy="$ALL_PROXY"
+```
+
+`.zshenv` 在所有 zsh 进程（包括非交互式子进程）中被最先加载。而 `.zshrc` 只在交互式 shell 中生效。
+
+**后果**：Codex CLI 或 VS Code 启动的非交互式 zsh 子进程（如脚本、构建工具、`codex app-server` 的后台进程）会继承有代理但**无 `no_proxy`** 的环境，导致本应直连 `localhost` 或 `127.0.0.1` 的流量被错误路由到出站代理。
+
+**解决方法**：在 `.zshenv` 中同时补充 `no_proxy`：
+
+```bash
+# ~/.zshenv
+export HTTP_PROXY="http://10.19.125.136:12000"
+export HTTPS_PROXY="http://10.19.125.136:12000"
+export ALL_PROXY="http://10.19.125.136:12000"
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTPS_PROXY"
+export all_proxy="$ALL_PROXY"
+export no_proxy="localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.svc,.cluster.local"
+export NO_PROXY="$no_proxy"
+```
+
+#### 集群出站代理的大连接断开问题
+
+本机代理 `http://10.19.125.136:12000` 在大文件传输（约 >300MB）时存在 TLS 连接中断问题：
+
+| 协议 | 现象 | 根因 |
+|---|---|---|
+| HTTPS (git) | `GnuTLS recv error (-9): Error decoding the received TLS packet` | 代理约 15–20 秒后断开 TLS 隧道 |
+| SSH | `client_loop: send disconnect: Broken pipe` | 网络层断连 |
+| `curl` (OpenSSL) | `OpenSSL SSL_read: unexpected eof while reading` | 代理在传输中途关闭连接 |
+| `wget` + 续传 | ✅ 最终成功 | 断线后自动重试续传 |
+
+**影响范围**：
+- `git clone --depth 1` 大仓库（pack 文件 >300MB）可能反复失败
+- 使用 `no_proxy` 将 `github.com` 排除出代理后问题消失（直连可达）
+
+**解决方法**：
+
+1. **优先方案** — 为 GitHub 设置直连（已验证直连可达）：
+   ```bash
+   # 在 .zshrc / .zshenv 中补充
+   export no_proxy="$no_proxy,github.com,raw.githubusercontent.com"
+   export NO_PROXY="$NO_PROXY,GITHUB.COM,RAW.GITHUBUSERCONTENT.COM"
+   ```
+
+2. **备用方案** — 使用 `wget` 续传下载 tarball 后本地初始化 git 仓库：
+   ```bash
+   wget --retry-connrefused --tries=0 --timeout=30 --read-timeout=30 --continue \
+     -O repo.tar.gz https://github.com/owner/repo/archive/main.tar.gz
+   tar xzf repo.tar.gz && mv repo-main repo && cd repo
+   git init && git add -A && git commit -m "Import"
+   git remote add origin git@github.com:owner/repo.git
+   ```
+
+3. **备用方案** — 通过 SSH 直连（需先确认 `no_proxy` 排除了 SSH 连接）：
+   ```bash
+   GIT_SSH_COMMAND="ssh -o ServerAliveInterval=30" git clone --depth 1 git@github.com:owner/repo.git
+   ```
+
+#### Codex Agent（VS Code Copilot）代理使用原则
+
+VS Code 内的 GitHub Copilot Agent（coding agent）也继承了 shell 环境变量中的代理配置。为确保代理只按需生效且不污染系统全局配置，应遵循以下原则：
+
+1. **不修改全局 git 配置**：Agent 不得设置 `git config --global http.proxy`、`http.version`、`http.postBuffer` 等。代理控制应完全由环境变量（来自 `.zshrc` / `.zshenv`）负责。
+2. **不修改系统级代理文件**：Agent 不得写入 `/etc/environment`、`/etc/profile.d/` 或 `systemd` unit。
+3. **局部代理策略**：Agent 需要访问外网（如 `git clone`、`curl` 下载）时，依赖 shell 继承的 `http_proxy`/`https_proxy` 环境变量。对于连接不稳定的代理，可优先使用 `wget` 续传或 `curl --retry`。
+4. **环境隔离**：Agent 的代理使用应与用户 shell 的代理配置保持一致。用户通过 `~/.zshrc` / `~/.bashrc` / `~/.zshenv` 管理代理，Agent 只利用已存在的环境变量，不做额外系统修改。
+5. **`no_proxy` 完整性**：确保 `no_proxy` 始终包含 `localhost,127.0.0.1`，避免 Agent 子进程的本地服务请求（如连接 `127.0.0.1:8317` 的 cliproxyapi）被错误路由到出站代理。
+
 ## 参考
 
 - [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
